@@ -40,6 +40,7 @@ from typing import Callable
 import numpy as np
 import pydicom
 from pydicom.uid import generate_uid
+from scipy.ndimage import map_coordinates
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +188,85 @@ def output_centers(positions: np.ndarray,
 
 
 # --------------------------------------------------------------------------- #
+# 任意面へのリスライス (AX / COR / SAG)
+# --------------------------------------------------------------------------- #
+# 患者座標系(LPS): +X=左, +Y=後, +Z=頭。各面の (列方向u, 行方向v, 法線n)。
+# u,v,n は正規直交基底。n は「スライス番号が増える向き」。
+ORIENTATIONS = {
+    "axial":    (np.array([1., 0., 0.]), np.array([0., 1., 0.]), np.array([0., 0., 1.])),
+    "coronal":  (np.array([1., 0., 0.]), np.array([0., 0., -1.]), np.array([0., 1., 0.])),
+    "sagittal": (np.array([0., 1., 0.]), np.array([0., 0., -1.]), np.array([1., 0., 0.])),
+}
+
+
+def input_affine(series: Series) -> np.ndarray:
+    """入力ボクセル添字 [col, row, slice, 1] -> 世界座標(LPS) のアフィン(4x4)。"""
+    tmpl = series.template
+    iop = np.array(tmpl.ImageOrientationPatient, float)
+    x_dir, y_dir = iop[0:3], iop[3:6]              # 列方向, 行方向
+    ps = [float(v) for v in tmpl.PixelSpacing]     # [row spacing, col spacing]
+    ps_row, ps_col = ps[0], ps[1]
+    dz = float(np.median(np.diff(series.positions)))
+    ipp0 = np.array(series.datasets[0].ImagePositionPatient, float)
+
+    A = np.eye(4)
+    A[:3, 0] = x_dir * ps_col      # col 添字
+    A[:3, 1] = y_dir * ps_row      # row 添字
+    A[:3, 2] = series.normal * dz  # slice 添字
+    A[:3, 3] = ipp0
+    return A
+
+
+def reslice_volume(series: Series,
+                   u: np.ndarray, v: np.ndarray, n: np.ndarray,
+                   in_plane_spacing: float,
+                   recon_step: float):
+    """
+    入力3Dボリュームを、出力面 (u,v,n) の正則格子へトリリニア再標本化する。
+    返り値: (V_fine[K,R,C], d_positions[K], a_min, b_min)
+      - K は法線方向の細かい刻み(recon_step)で刻んだ枚数
+      - 後段で build_weights によりプロファイル積分→出力スライスに集約する
+    """
+    A = input_affine(series)
+    Ainv = np.linalg.inv(A)
+    K_in, R_in, C_in = series.volume.shape
+
+    # 入力ボリューム8隅を世界座標へ→出力軸へ射影して範囲を決める
+    corners = []
+    for ck in (0, K_in - 1):
+        for cr in (0, R_in - 1):
+            for cc in (0, C_in - 1):
+                corners.append(A @ np.array([cc, cr, ck, 1.0]))
+    corners = np.array(corners)[:, :3]
+    a = corners @ u; b = corners @ v; d = corners @ n
+    a_min, a_max = a.min(), a.max()
+    b_min, b_max = b.min(), b.max()
+    d_min, d_max = d.min(), d.max()
+
+    C_out = int(np.ceil((a_max - a_min) / in_plane_spacing)) + 1
+    R_out = int(np.ceil((b_max - b_min) / in_plane_spacing)) + 1
+    K_out = int(np.ceil((d_max - d_min) / recon_step)) + 1
+
+    cc = a_min + np.arange(C_out) * in_plane_spacing      # (C,)
+    rr = b_min + np.arange(R_out) * in_plane_spacing      # (R,)
+    d_positions = d_min + np.arange(K_out) * recon_step   # (K,)
+
+    # 面内の世界座標(法線成分を除く)を事前計算: (R, C, 3)
+    base = cc[None, :, None] * u[None, None, :] + rr[:, None, None] * v[None, None, :]
+    V_fine = np.empty((K_out, R_out, C_out), dtype=np.float32)
+    vol = series.volume  # (K_in, R_in, C_in) = (slice, row, col)
+
+    for ki, dval in enumerate(d_positions):
+        world = base + dval * n[None, None, :]            # (R, C, 3)
+        homog = np.concatenate([world, np.ones((R_out, C_out, 1))], axis=-1)
+        vox = homog @ Ainv.T                              # (R, C, 4) -> [col,row,slice]
+        coords = np.stack([vox[..., 2], vox[..., 1], vox[..., 0]], axis=0)  # (slice,row,col)
+        V_fine[ki] = map_coordinates(vol, coords, order=1, mode="constant", cval=0.0)
+
+    return V_fine, d_positions, a_min, b_min
+
+
+# --------------------------------------------------------------------------- #
 # DICOM書き出し
 # --------------------------------------------------------------------------- #
 def write_output(series: Series,
@@ -246,6 +326,62 @@ def write_output(series: Series,
         ds.save_as(os.path.join(out_dir, f"{k + 1:05d}.DCM"))
 
 
+def _encode_px(ds: pydicom.Dataset, real: np.ndarray,
+               slope: float, intercept: float) -> np.ndarray:
+    """real-world値 -> 格納画素値に戻し、dtype範囲にクリップ。"""
+    px = (real - intercept) / slope
+    bits = int(getattr(ds, "BitsStored", 16))
+    signed = int(getattr(ds, "PixelRepresentation", 0)) == 1
+    if signed:
+        lo, hi, dtype = -(2 ** (bits - 1)), 2 ** (bits - 1) - 1, np.int16
+    else:
+        lo, hi, dtype = 0, 2 ** bits - 1, np.uint16
+    return np.clip(np.round(px), lo, hi).astype(dtype)
+
+
+def write_resliced(series: Series,
+                   u: np.ndarray, v: np.ndarray, n: np.ndarray,
+                   a_min: float, b_min: float,
+                   in_plane_spacing: float,
+                   centers: np.ndarray,
+                   out_volume: np.ndarray,
+                   thickness: float, spacing: float,
+                   out_dir: str, series_desc: str) -> None:
+    """AX/COR/SAG リスライス結果を、出力面のジオメトリでDICOM書き出し。"""
+    os.makedirs(out_dir, exist_ok=True)
+    new_series_uid = generate_uid()
+    tmpl = series.template
+    slope = float(getattr(tmpl, "RescaleSlope", 1) or 1)
+    intercept = float(getattr(tmpl, "RescaleIntercept", 0) or 0)
+    iop = [float(x) for x in (*u, *v)]
+
+    for k, c in enumerate(centers):
+        ds = pydicom.dcmread(series.datasets[0].filename)
+        # 出力スライスの (row0,col0) 世界座標 = a_min*u + b_min*v + c*n
+        ipp = a_min * u + b_min * v + c * n
+        px = _encode_px(ds, out_volume[k], slope, intercept)
+
+        ds.PixelData = px.tobytes()
+        ds.Rows, ds.Columns = px.shape
+        ds.PixelSpacing = [float(in_plane_spacing), float(in_plane_spacing)]
+        ds.ImageOrientationPatient = iop
+        ds.ImagePositionPatient = [float(x) for x in ipp]
+        ds.SliceThickness = float(thickness)
+        ds.SpacingBetweenSlices = float(spacing)
+        ds.SliceLocation = float(c)
+        ds.InstanceNumber = k + 1
+        ds.SeriesInstanceUID = new_series_uid
+        ds.SOPInstanceUID = generate_uid()
+        if hasattr(ds, "file_meta"):
+            ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+        ds.SeriesDescription = series_desc
+        it = list(getattr(ds, "ImageType", ["DERIVED", "SECONDARY"]))
+        if it and it[0] == "ORIGINAL":
+            it[0] = "DERIVED"
+        ds.ImageType = it
+        ds.save_as(os.path.join(out_dir, f"{k + 1:05d}.DCM"))
+
+
 # --------------------------------------------------------------------------- #
 def simulate(in_dir: str,
              out_dir: str,
@@ -255,9 +391,13 @@ def simulate(in_dir: str,
              support: float | None,
              start: float | None,
              pattern: str,
-             series_desc: str) -> None:
+             series_desc: str,
+             orientation: str = "native",
+             in_plane_spacing: float | None = None,
+             recon_step: float | None = None) -> None:
     series = load_series(in_dir, pattern)
     dz_in = float(np.median(np.diff(series.positions)))
+    ps_in = [float(x) for x in series.template.PixelSpacing]
     print(f"[load] {len(series.datasets)} slices, in-plane "
           f"{series.template.Rows}x{series.template.Columns}, "
           f"slice spacing ~{dz_in:.3f} mm, normal={np.round(series.normal,3)}")
@@ -267,16 +407,30 @@ def simulate(in_dir: str,
         # 矩形は thickness、裾を持つプロファイルは余裕を見て広めに取る
         support = thickness if profile_name == "rect" else thickness * 3.0
 
-    centers = output_centers(series.positions, spacing, thickness, start)
-    W = build_weights(series.positions, centers, profile, support)
-
-    # (n_out, n_in) x (n_in, rows*cols) -> (n_out, rows*cols)
-    nz, ny, nx = series.volume.shape
-    out = (W @ series.volume.reshape(nz, ny * nx)).reshape(-1, ny, nx)
-    print(f"[sim ] profile={profile_name} FWHM={thickness}mm support={support}mm "
-          f"-> {centers.size} slices @ {spacing}mm spacing")
-
-    write_output(series, centers, out, thickness, spacing, out_dir, series_desc)
+    if orientation == "native":
+        # 入力スライス方向に沿って集約（リスライスなし）
+        centers = output_centers(series.positions, spacing, thickness, start)
+        W = build_weights(series.positions, centers, profile, support)
+        nz, ny, nx = series.volume.shape
+        out = (W @ series.volume.reshape(nz, ny * nx)).reshape(-1, ny, nx)
+        print(f"[sim ] native profile={profile_name} FWHM={thickness}mm "
+              f"support={support}mm -> {centers.size} slices @ {spacing}mm spacing")
+        write_output(series, centers, out, thickness, spacing, out_dir, series_desc)
+    else:
+        # AX/COR/SAG: 患者座標系でリスライスしてからプロファイル積分
+        u, v, n = ORIENTATIONS[orientation]
+        ips = in_plane_spacing or min(ps_in)
+        step = recon_step or min(*ps_in, dz_in)
+        V_fine, d_pos, a_min, b_min = reslice_volume(series, u, v, n, ips, step)
+        centers = output_centers(d_pos, spacing, thickness, start)
+        W = build_weights(d_pos, centers, profile, support)
+        K, R, C = V_fine.shape
+        out = (W @ V_fine.reshape(K, R * C)).reshape(-1, R, C)
+        print(f"[sim ] {orientation} profile={profile_name} FWHM={thickness}mm "
+              f"support={support}mm in-plane={ips:.3f}mm recon-step={step:.3f}mm "
+              f"-> {centers.size} slices {R}x{C} @ {spacing}mm spacing")
+        write_resliced(series, u, v, n, a_min, b_min, ips,
+                       centers, out, thickness, spacing, out_dir, series_desc)
     print(f"[save] {centers.size} files -> {out_dir}")
 
 
@@ -295,10 +449,19 @@ def main() -> None:
                     help="先頭出力スライス中心の法線方向位置 [mm] (default: 入力先頭)")
     ap.add_argument("--pattern", default="*", help="入力ファイルのglobパターン (default *)")
     ap.add_argument("--desc", default="Simulated 2D thick-slice", help="SeriesDescription")
+    ap.add_argument("--orientation", choices=["native", "axial", "coronal", "sagittal"],
+                    default="native",
+                    help="出力面 (default native=入力スライス方向)。axial/coronal/sagittal は"
+                         "患者座標系でリスライスして生成")
+    ap.add_argument("--in-plane-spacing", type=float, default=None,
+                    help="リスライス時の面内画素間隔 [mm] (default: 入力の最小画素間隔)")
+    ap.add_argument("--recon-step", type=float, default=None,
+                    help="リスライス時の法線方向の細刻み [mm] (default: 入力の最小間隔)")
     args = ap.parse_args()
 
     simulate(args.input, args.output, args.thickness, args.spacing,
-             args.profile, args.support, args.start, args.pattern, args.desc)
+             args.profile, args.support, args.start, args.pattern, args.desc,
+             args.orientation, args.in_plane_spacing, args.recon_step)
 
 
 if __name__ == "__main__":

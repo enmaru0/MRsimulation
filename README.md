@@ -97,6 +97,42 @@ python3 -m venv .venv
 | `--start` | 入力先頭 | 先頭出力スライス中心の法線方向位置 [mm] |
 | `--pattern` | `*` | 入力ファイルの glob パターン |
 | `--desc` | `Simulated 2D thick-slice` | 出力の `SeriesDescription` |
+| `--orientation` | `native` | 出力面: `native`(入力スライス方向) / `axial` / `coronal` / `sagittal` |
+| `--in-plane-spacing` | 入力最小 | リスライス時の面内画素間隔 [mm] |
+| `--recon-step` | 入力最小 | リスライス時の法線方向の細刻み [mm] |
+
+---
+
+## 出力面の選択（AX / COR / SAG）
+
+`--orientation` で出力2Dの面を選べる。`native` は入力のスライス方向に沿って集約する
+（リスライスなし、最速）。`axial` / `coronal` / `sagittal` を指定すると、患者座標系(LPS)で
+3Dボリュームを **その面へリスライス（トリリニア再標本化）してから** プロファイル積分する。
+
+```bash
+# 軸位で取得した3Dデータから冠状断の5mm厚2Dを生成
+.venv/bin/python mri_slice_sim.py SampleData out_cor \
+    --thickness 5 --spacing 6 --orientation coronal --pattern "*.DCM"
+```
+
+処理の流れ:
+
+1. 入力DICOMのジオメトリ(`IOP`/`PixelSpacing`/スライス位置)からボクセル→患者座標(LPS)の
+   アフィンを構築
+2. 出力面の正規直交基底 (列 u, 行 v, 法線 n) を設定（下表）
+3. 法線方向に細かい刻み(`--recon-step`)で 3D を再標本化し、`build_weights` で
+   プロファイル積分 → 指定厚・間隔の2Dスライスに集約
+4. 出力面の `IOP`/`IPP`/`PixelSpacing` を付けて書き出し
+
+| 面 | 列方向 u | 行方向 v | 法線 n (スライス積み上げ) | DICOM `IOP` |
+|---|---|---|---|---|
+| axial | L→R `[1,0,0]` | A→P `[0,1,0]` | I→S `[0,0,1]` | `[1,0,0, 0,1,0]` |
+| coronal | L→R `[1,0,0]` | S→I `[0,0,-1]` | A→P `[0,1,0]` | `[1,0,0, 0,0,-1]` |
+| sagittal | A→P `[0,1,0]` | S→I `[0,0,-1]` | R→L `[1,0,0]` | `[0,1,0, 0,0,-1]` |
+
+> 注: リスライスの面内解像度は元データの解像度に律速される。等方性に近い3D入力では
+> どの面でもほぼ同等だが、異方性入力(例: 薄い面内・厚いスライス)では、元のスライス方向を
+> 面内に含む再フォーマット面の分解能が粗くなる。
 
 ---
 
