@@ -363,12 +363,45 @@ done
 | `--kspace-keep` | `1.0` | k空間中央の保持割合(0-1]。<1でGibbs/解像度低下 |
 | `--downsample` | `1.0` | 取得解像度の縮小率(0-1]。<1で縮小→ノイズ→拡大 |
 | `--t1-strength` | `0` | 低磁場T1短縮の近似強度[0-1]（近似なので注意） |
+| `--profile` | — | `lowfield_calibrate.py` のコントラスト別プロファイル(.json)。実低磁場に合わせて上書き |
 | `--seed` | `0` | 乱数シード（データ拡張用） |
+
+### 実低磁場サンプルからの較正 (`lowfield_calibrate.py`)
+
+**unpaired（高磁場と別患者）** の実低磁場サンプルから、**コントラスト別の劣化プロファイル**
+を実測して JSON 化する。保存するのは**スケール不変量**だけなので別スキャナ/別患者の
+高磁場へ転用できる。
+
+| 実測量 | 内容 | 生成時の使われ方 |
+|---|---|---|
+| `target_snr` | 代表信号/ノイズσ（コーナー空気のRayleigh） | Ricianノイズ量を合わせる |
+| `intensity_quantiles` | 前景輝度の正規化分位（コントラスト記述子） | **ヒストグラムマッチング**で低磁場の見た目（T1短縮等）を移植 |
+| `resolution_mm` | 取得面内解像度(PixelSpacing) | 高磁場との差を等価ボケσに換算 |
+
+```bash
+# 各コントラストごとにプロファイルを作成（unpairedでOK）
+python lowfield_calibrate.py real_low_T1    --name T1    --out prof_T1.json
+python lowfield_calibrate.py real_low_T2    --name T2    --out prof_T2.json
+python lowfield_calibrate.py real_low_FLAIR --name FLAIR --out prof_FLAIR.json
+
+# 高磁場の同コントラストへ適用（ノイズ/解像度/コントラストを実低磁場に合わせる）
+python lowfield_sim.py high_T1    out_T1    --profile prof_T1.json --pattern "*.dcm"
+python lowfield_sim.py high_FLAIR out_FLAIR --profile prof_FLAIR.json --pattern "*.dcm"
+```
+
+`--profile` 指定時は `target_snr`・`resolution_mm`・`intensity_quantiles` が
+`--field-*`/`--blur-mm`/`--t1-strength` より優先される（`--blur-mm` はさらに上乗せ可）。
 
 ### 注意・限界
 
+- **コントラスト変換は周辺分布のヒストグラムマッチング**（unpairedで可能な範囲）。
+  同部位・同コントラストのサンプルを使うこと。per-pixelの厳密変換にはペアが必要。
+- **解像度は取得PixelSpacingの差から換算**（スペクトルからの自動推定は強ノイズで
+  不安定なため不採用）。低磁場がゼロフィル補間で見かけ高精細な場合は実解像度を
+  反映しないので、その時は `--blur-mm` で明示的に補う。
 - **単一コイル magnitude を仮定**（Rician）。パラレルイメージング/多コイルは
-  noncentral-chi + 空間変動 g-factor になるため本ツールは近似。
+  noncentral-chi + 空間変動 g-factor になるため本ツールは近似（`target_snr` は実測値
+  として妥当だが、g-factorの空間変動は平均化される）。
 - **T1コントラスト変化は粗い近似**。T2強調など磁場ロバストなコントラストでは省略可。
   厳密化には定量マップ(T1/T2)＋信号方程式が必要。
 - 低磁場の **厚いスライス** も同時に作る場合は `mri_slice_sim.py` と組み合わせる。

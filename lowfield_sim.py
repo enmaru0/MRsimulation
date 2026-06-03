@@ -36,6 +36,7 @@ lowfield_sim.py
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -122,6 +123,35 @@ def resolution_downup(img: np.ndarray, factor: float,
 
 
 # --------------------------------------------------------------------------- #
+# 実低磁場プロファイル較正・適用の共有ヘルパ（unpaired・スケール不変量）
+# --------------------------------------------------------------------------- #
+def foreground_mask(img: np.ndarray, pct: float = 55.0) -> np.ndarray:
+    return img > np.percentile(img, pct)
+
+
+def res_to_blur_sigma(res_low: float, res_high: float) -> float:
+    """取得面内解像度の差を等価ガウシアンσ[mm]に換算（FWHM差→σ）。
+
+    解像度は実低磁場/高磁場の DICOM PixelSpacing（取得面内解像度）から取る。
+    スペクトルからの解像度推定は強ノイズで不安定なため、安定なこの方式を主とする。
+    """
+    fwhm_add = float(np.sqrt(max(res_low ** 2 - res_high ** 2, 0.0)))
+    return fwhm_add / 2.3548
+
+
+def fg_quantiles(vol: np.ndarray, probs: np.ndarray, pct: float = 55.0) -> np.ndarray:
+    """前景輝度の分位値。コントラスト（組織輝度関係）の記述子。"""
+    fg = vol[vol > np.percentile(vol, pct)]
+    return np.quantile(fg, probs)
+
+
+def histogram_match(img: np.ndarray, src_q: np.ndarray,
+                    tgt_q: np.ndarray) -> np.ndarray:
+    """src分位→tgt分位 の単調写像で輝度を変換（ヒストグラムマッチング）。"""
+    return np.interp(img, src_q, tgt_q)
+
+
+# --------------------------------------------------------------------------- #
 # T1コントラスト（任意・近似）
 # --------------------------------------------------------------------------- #
 def approx_t1_contrast(img: np.ndarray, strength: float) -> np.ndarray:
@@ -143,10 +173,34 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
                       ref_low: str | None,
                       blur_mm: float, in_plane_res: float | None,
                       kspace_keep: float, downsample: float,
-                      t1_strength: float, seed: int, desc: str) -> None:
+                      t1_strength: float, seed: int, desc: str,
+                      profile: str | None = None) -> None:
     s = load_series(in_dir, pattern)
-    vol = s.volume
+    vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
+
+    # 実低磁場プロファイル（lowfield_calibrate.py 出力）を適用
+    if profile is not None:
+        prof = json.load(open(profile))
+        # コントラスト: 高磁場前景を低磁場の正規化分位へヒストグラムマッチング
+        nq = len(prof["intensity_quantiles"])
+        probs = np.linspace(0.0, 1.0, nq)
+        src_q = fg_quantiles(vol, probs)
+        scale = signal_level(vol)                       # 高磁場の代表レベルで再スケール
+        tgt_q = np.asarray(prof["intensity_quantiles"]) * scale
+        # 0アンカー: 背景(空気)を0付近に保つ（前景分位だけだと空気が持ち上がる）
+        src_q = np.concatenate([[0.0], src_q])
+        tgt_q = np.concatenate([[0.0], tgt_q])
+        vol = histogram_match(vol, src_q, tgt_q)
+        # ノイズ・解像度の目標を上書き（解像度は取得PixelSpacing差から安定に換算）
+        target_snr = float(prof["target_snr"])
+        res_low = float(prof["resolution_mm"])
+        blur_mm = max(blur_mm, res_to_blur_sigma(res_low, min(ps)))
+        t1_strength = 0.0                               # コントラストは適用済み
+        print(f"[prof] {profile} name={prof.get('name','?')} "
+              f"target_snr={target_snr:.1f} res_low={res_low:.2f}mm "
+              f"res_high={min(ps):.2f}mm -> blur={blur_mm:.2f}mm")
+
     sigma_high = estimate_sigma_rayleigh(vol)
     sig = signal_level(vol)
 
@@ -249,13 +303,17 @@ def main() -> None:
                     help="低磁場T1短縮の近似強度[0-1]（既定0=OFF, 近似なので注意）")
     ap.add_argument("--seed", type=int, default=0, help="乱数シード")
     ap.add_argument("--desc", default="Simulated low-field", help="SeriesDescription")
+    ap.add_argument("--profile", default=None,
+                    help="lowfield_calibrate.py が出力したコントラスト別プロファイル(.json)。"
+                         "ノイズ/解像度/コントラストを実低磁場に合わせて上書き")
     args = ap.parse_args()
 
     simulate_lowfield(args.input, args.output, args.pattern,
                       args.field_high, args.field_low, args.snr_exponent,
                       args.target_snr, args.noise_sigma, args.ref_low,
                       args.blur_mm, args.in_plane_res, args.kspace_keep,
-                      args.downsample, args.t1_strength, args.seed, args.desc)
+                      args.downsample, args.t1_strength, args.seed, args.desc,
+                      args.profile)
 
 
 if __name__ == "__main__":
