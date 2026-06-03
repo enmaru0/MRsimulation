@@ -67,6 +67,36 @@ def estimate_sigma_rayleigh(vol: np.ndarray, corner_frac: float = 0.0625) -> flo
     return float(np.sqrt(min(m2) / 2.0))
 
 
+def noise_sigma_laplacian(vol: np.ndarray, fg_percentile: float = 55.0) -> float:
+    """組織内の高周波(Laplacian)のMADからノイズσを推定（背景マスク/PIに頑健）。
+
+    背景が0に潰されている/多コイルでコーナーが当てにならない場合の代替。
+    Laplacianカーネル(||L||=6)の応答はノイズで std=6σ。エッジは疎な外れ値なので
+    MAD(中央絶対偏差)で頑健に σ ≈ MAD/0.6745/6 を得る。組織テクスチャ分やや過大。
+    """
+    from scipy.ndimage import convolve
+    L = np.array([[1.0, -2, 1], [-2, 4, -2], [1, -2, 1]])
+    cen = vol[vol.shape[0] // 2] if vol.ndim == 3 else vol
+    mask = cen > np.percentile(cen, fg_percentile)
+    conv = convolve(cen.astype(float), L)[mask]
+    if conv.size < 100:
+        return 0.0
+    mad = float(np.median(np.abs(conv - np.median(conv))))
+    return mad / 0.6745 / 6.0
+
+
+def estimate_noise_sigma(vol: np.ndarray):
+    """ノイズσを頑健に推定。返り値 (sigma, sigma_corner, sigma_laplacian, masked_bg)。
+
+    通常はコーナー(空気)のRayleighが最もクリーン。背景が0マスク/強い平滑化で
+    コーナーσが Laplacian推定より極端に小さい場合は背景マスクとみなし Laplacian を採用。
+    """
+    sc = estimate_sigma_rayleigh(vol)
+    sl = noise_sigma_laplacian(vol)
+    masked = sc < 0.3 * sl
+    return (sl if masked else sc), sc, sl, masked
+
+
 def signal_level(vol: np.ndarray, fg_percentile: float = 60.0) -> float:
     """前景の代表信号レベル（SNR表示用）。"""
     fg = vol[vol > np.percentile(vol, fg_percentile)]
@@ -196,7 +226,8 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
                       t1_strength: float, seed: int, desc: str,
                       profile: str | None = None,
                       blur_scale: float = 1.0,
-                      contrast_strength: float = 1.0) -> None:
+                      contrast_strength: float = 1.0,
+                      noise_scale: float = 1.0) -> None:
     s = load_series(in_dir, pattern)
     vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
@@ -230,7 +261,7 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
               f"res_low={res_low:.2f}mm res_high={res_high:.2f}mm "
               f"blur_scale={blur_scale} -> blur={blur_mm:.2f}mm")
 
-    sigma_high = estimate_sigma_rayleigh(vol)
+    sigma_high, _, _, _ = estimate_noise_sigma(vol)
     sig = signal_level(vol)
 
     # 目標ノイズ σ_low の決定（優先順位: noise_sigma > target_snr > ref_low > field比）
@@ -242,16 +273,16 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         how = "target-snr"
     elif ref_low is not None:
         sref = load_series(ref_low, pattern)
-        sigma_low = estimate_sigma_rayleigh(sref.volume)
+        s_low, _, _, _ = estimate_noise_sigma(sref.volume)
         # 信号スケールが違う可能性 → 参照のSNRを高磁場の信号レベルへ換算
         sref_sig = signal_level(sref.volume)
-        sigma_low = sigma_low * (sig / (sref_sig + 1e-9))
+        sigma_low = s_low * (sig / (sref_sig + 1e-9))
         how = f"ref-low({os.path.basename(ref_low)})"
     else:
         sigma_low = sigma_high * (field_high / field_low) ** snr_exp
         how = f"field {field_high}T->{field_low}T ^{snr_exp}"
 
-    sigma_add = float(np.sqrt(max(sigma_low ** 2 - sigma_high ** 2, 0.0)))
+    sigma_add = float(np.sqrt(max(sigma_low ** 2 - sigma_high ** 2, 0.0))) * noise_scale
 
     # 解像度ボケσの決定（in_plane_res 指定があれば等価ガウシアン幅へ換算）
     if in_plane_res is not None and in_plane_res > min(ps):
@@ -340,6 +371,8 @@ def main() -> None:
                     help="profile由来ボケの倍率（ボケすぎなら<1, 例0.5。0で無効化）")
     ap.add_argument("--contrast-strength", type=float, default=1.0,
                     help="コントラスト変換の強度[0-1]（1=完全に低磁場へ, 0=原画コントラスト）")
+    ap.add_argument("--noise-scale", type=float, default=1.0,
+                    help="付加ノイズσの倍率（ノイズ不足なら>1, 例1.5）")
     args = ap.parse_args()
 
     simulate_lowfield(args.input, args.output, args.pattern,
@@ -347,7 +380,8 @@ def main() -> None:
                       args.target_snr, args.noise_sigma, args.ref_low,
                       args.blur_mm, args.in_plane_res, args.kspace_keep,
                       args.downsample, args.t1_strength, args.seed, args.desc,
-                      args.profile, args.blur_scale, args.contrast_strength)
+                      args.profile, args.blur_scale, args.contrast_strength,
+                      args.noise_scale)
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ import os
 import numpy as np
 
 from mri_slice_sim import load_series
-from lowfield_sim import (estimate_sigma_rayleigh, signal_level, fg_quantiles,
+from lowfield_sim import (estimate_noise_sigma, signal_level, fg_quantiles,
                           inplane_resolution_mm)
 
 
@@ -56,8 +56,8 @@ def calibrate_profile(low_dir: str, pattern: str, name: str,
     s = load_series(low_dir, pattern)
     vol = s.volume
 
-    # ノイズ・SNR
-    sigma = estimate_sigma_rayleigh(vol)
+    # ノイズ・SNR（背景マスク/PIに頑健: コーナーσが潰れていればLaplacianへ）
+    sigma, sc, sl, masked = estimate_noise_sigma(vol)
     sig = signal_level(vol)
     target_snr = sig / (sigma + 1e-9)
 
@@ -86,7 +86,9 @@ def calibrate_profile(low_dir: str, pattern: str, name: str,
     print(f"[calib] {name}: {vol.shape[0]} slices  ps={ps}mm")
     print(f"  resolution: recon(PixelSpacing)={recon_res:.2f}mm  "
           f"acquired(AcqMatrix)={resolution_mm:.2f}mm")
-    print(f"  noise σ≈{sigma:.2f}  signal≈{sig:.1f}  -> target_snr={target_snr:.1f}")
+    print(f"  noise: corner σ={sc:.2f}  laplacian σ={sl:.2f}  "
+          f"{'[背景マスク検出→laplacian採用]' if masked else '[corner採用]'}")
+    print(f"  -> σ={sigma:.2f}  signal≈{sig:.1f}  target_snr={target_snr:.1f}")
 
     # 高磁場が与えられたら解像度ノブの推奨値を算出して表示・保存
     if high_dir:

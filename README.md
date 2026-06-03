@@ -400,9 +400,17 @@ profileを当てた結果がズレるとき、以下で後調整できる（prof
 |---|---|---|
 | **ボケすぎ/不足** | `--blur-scale`（既定1.0） | profile由来ボケの倍率。ボケすぎなら `0.5` 等、`0` で無効化 |
 | ボケを足す | `--blur-mm` | profile由来ボケに上乗せ |
-| **ノイズ量** | `--target-snr` / `--noise-sigma` | 明示するとprofileのSNRより優先 |
+| **ノイズすぎ/不足** | `--noise-scale`（既定1.0） | 付加ノイズσの倍率。不足なら `1.5` 等 |
+| ノイズ量(直接) | `--target-snr` / `--noise-sigma` | 明示するとprofileのSNRより優先 |
 | **コントラスト強度** | `--contrast-strength`（既定1.0） | `1`=完全に低磁場へ / `0`=原画コントラスト / 中間でブレンド |
 | リンギング | `--kspace-keep` | profileと併用してGibbsを追加 |
+
+> ノイズが少なすぎる典型原因は、**実低磁場の背景(空気)が0マスクされている**こと。
+> コーナーからσを測ると0になり target_snr が過大 → ほぼ無ノイズになる。
+> `lowfield_calibrate.py` は背景マスクを検出すると**組織内の高周波(Laplacian-MAD)から
+> ノイズを実測**するフォールバックに切替える（calibrate出力に corner σ / laplacian σ と
+> 採用理由を表示）。それでも合わなければ `--noise-scale` で微調整する。多コイル/PIで
+> 中心ほどノイズが高い(g-factor)場合も、Laplacian推定は組織内ノイズを拾うため有効。
 
 > ボケすぎる典型原因は、profileの取得解像度 `resolution_mm` が `AcquisitionMatrix` から
 > 大きめに出るケース。まず `--blur-scale 0.5` 程度から実低磁場の見た目に合わせて調整する。
