@@ -240,7 +240,9 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
                       profile: str | None = None,
                       blur_scale: float = 1.0,
                       contrast_strength: float = 1.0,
-                      noise_scale: float = 1.0) -> None:
+                      noise_scale: float = 1.0,
+                      noise_corr_mm: float | None = None,
+                      limit: int = 0) -> None:
     s = load_series(in_dir, pattern)
     vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
@@ -283,6 +285,10 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
               f"res_low={res_low:.2f}mm res_high={res_high:.2f}mm "
               f"blur={blur_mm:.2f}mm noise_corr={noise_corr_px:.1f}px")
 
+    # ノイズ相関長を手動指定（無参照での粗さ調整 / profile値の上書き）
+    if noise_corr_mm is not None:
+        noise_corr_px = noise_corr_mm / min(ps)
+
     sigma_high, _, _, _ = estimate_noise_sigma(vol)
     sig = signal_level(vol)
 
@@ -319,7 +325,8 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
     print(f"[load] {vol.shape[0]} slices {vol.shape[1]}x{vol.shape[2]}, ps={ps}mm")
     print(f"[noise] σ_high≈{sigma_high:.2f} (SNR≈{snr_before:.1f}) -> "
           f"σ_low={sigma_low:.2f} (SNR≈{snr_after:.1f}) via {how}; σ_add={sigma_add:.2f}")
-    print(f"[res ] blur={blur_eff:.2f}mm kspace_keep={kspace_keep} downsample={downsample}")
+    print(f"[res ] blur={blur_eff:.2f}mm kspace_keep={kspace_keep} "
+          f"downsample={downsample} noise_corr={noise_corr_px:.1f}px")
 
     os.makedirs(out_dir, exist_ok=True)
     new_uid = generate_uid()
@@ -328,6 +335,8 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
     intercept = float(getattr(s.template, "RescaleIntercept", 0) or 0)
 
     for k, ds in enumerate(s.datasets):
+        if limit and k >= limit:
+            break
         img = vol[k].copy()
         if t1_strength > 0:
             img = approx_t1_contrast(img, t1_strength)
@@ -395,6 +404,10 @@ def main() -> None:
                     help="コントラスト変換の強度[0-1]（1=完全に低磁場へ, 0=原画コントラスト）")
     ap.add_argument("--noise-scale", type=float, default=1.0,
                     help="付加ノイズσの倍率（ノイズ不足なら>1, 例1.5）")
+    ap.add_argument("--noise-corr-mm", type=float, default=None,
+                    help="ノイズの空間相関長[mm]（粗さ。無参照調整用。例: 取得ボクセル相当1.5）")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="先頭Nスライスだけ生成（>0で素早く目視確認）")
     args = ap.parse_args()
 
     simulate_lowfield(args.input, args.output, args.pattern,
@@ -403,7 +416,7 @@ def main() -> None:
                       args.blur_mm, args.in_plane_res, args.kspace_keep,
                       args.downsample, args.t1_strength, args.seed, args.desc,
                       args.profile, args.blur_scale, args.contrast_strength,
-                      args.noise_scale)
+                      args.noise_scale, args.noise_corr_mm, args.limit)
 
 
 if __name__ == "__main__":

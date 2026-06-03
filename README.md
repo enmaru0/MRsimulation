@@ -448,6 +448,34 @@ python lowfield_calibrate.py real_low_T1 --name T1 --high high_T1 --out prof_T1.
 `--blur-mm` は実低磁場の見た目に合わせる微調整に使う。`--profile` 適用時は profile の
 `resolution_mm`（取得解像度）から `--blur-mm` 相当が自動で入る。
 
+### 参照画像なしで目視調整するワークフロー
+
+実低磁場が手元に無い/profileを使わず、出力を見ながら手で合わせる場合。各ノブはほぼ独立なので
+**解像度 → ノイズ量 → ノイズの粗さ → 任意アーチファクト** の順で詰める。`--limit` で
+数枚だけ生成すれば素早く反復できる。
+
+```bash
+# 数枚だけ生成して目視（反復を高速化）
+python lowfield_sim.py high_T2 out_try --pattern "*.dcm" --limit 3 \
+    --target-snr 8 --downsample 0.5 --noise-corr-mm 1.5
+```
+
+| 順 | 何を見る | ノブ | 目安 |
+|---|---|---|---|
+| 1 | **解像度/ボケ** | `--downsample ρ`（推奨）or `--blur-mm` | ρ=res_high/res_low。0.5T≈1.0–1.5mm, 0.3T≈1.5–2.0mm相当 |
+| 2 | **ノイズ量** | `--target-snr`（or `--field-low`） | 組織がザラつくが構造は見える程度。低磁場ほど低SNR |
+| 3 | **ノイズの粗さ** | `--noise-corr-mm` | 取得ボクセル相当（例1.5mm）。細かすぎ＝薄く見えるなら上げる |
+| 4 | リンギング | `--kspace-keep ρ` | 実機にGibbsが見えるなら |
+| 5 | T1コントラスト | `--t1-strength`（T1強調のみ） | 0.2–0.4程度から |
+
+ポイント:
+- **`--downsample` を主に使うと解像度低下と粗い相関ノイズが同時に入る**ので、まずこれだけで
+  低磁場らしくなる。`--blur-mm`＋`--noise-corr-mm` で個別に詰めてもよい。
+- ノイズが「量はあるのに薄い」ときは `--noise-corr-mm` を上げる（白色だと細かすぎる）。
+- SNRの絶対値はシーケンス依存なので、数値にこだわらず**見た目で**合わせる。`--field-low` で
+  おおよそ当て、`--target-snr`/`--noise-scale` で微調整。
+- 決まったら `--limit` を外して全スライス生成。`--seed` を変えれば学習用に複数バリエーション。
+
 ### 手動ノイズ計測 (`measure_noise.py`)
 
 自動推定が当てにならない時、ビューアで読み取ったROI座標 `x,y,w,h`（x=列,y=行）で
