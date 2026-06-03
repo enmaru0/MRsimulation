@@ -37,7 +37,8 @@ import os
 
 import numpy as np
 import pydicom
-from scipy.ndimage import map_coordinates, uniform_filter, gaussian_filter
+from scipy.ndimage import (map_coordinates, uniform_filter, gaussian_filter,
+                           gaussian_gradient_magnitude)
 from scipy.optimize import minimize_scalar, minimize
 from scipy.stats import spearmanr
 
@@ -98,27 +99,40 @@ def sample_planes(vol3d: np.ndarray, Ainv3d: np.ndarray,
 # --------------------------------------------------------------------------- #
 # 較正本体
 # --------------------------------------------------------------------------- #
-def _fit_ab(x: np.ndarray, y: np.ndarray):
-    """y ≈ a*x + b の最小二乗解 (a, b)。"""
-    A = np.vstack([x, np.ones_like(x)]).T
-    (a, b), *_ = np.linalg.lstsq(A, y, rcond=None)
+def _fit_ab(x: np.ndarray, y: np.ndarray, w: np.ndarray | None = None):
+    """y ≈ a*x + b の(重み付き)最小二乗解 (a, b)。"""
+    if w is None:
+        A = np.vstack([x, np.ones_like(x)]).T
+        (a, b), *_ = np.linalg.lstsq(A, y, rcond=None)
+        return a, b
+    Sw = w.sum(); Swx = (w * x).sum(); Swy = (w * y).sum()
+    Swxx = (w * x * x).sum(); Swxy = (w * x * y).sum()
+    det = Sw * Swxx - Swx * Swx + 1e-12
+    a = (Sw * Swxy - Swx * Swy) / det
+    b = (Swxx * Swy - Swx * Swxy) / det
     return a, b
 
 
 def fit_profile(Pmat: np.ndarray, y: np.ndarray, offsets: np.ndarray,
-                nominal: float):
+                nominal: float, pix_w: np.ndarray | None = None):
     """
-    Pmat: (T, N) 各オフセットの標本値（前景画素を連結）
-    y   : (N,)   対応する実2D画素値
+    Pmat : (T, N) 各オフセットの標本値（前景画素を連結）
+    y    : (N,)   対応する実2D画素値
+    pix_w: (N,)   画素重み（エッジ重み付けに使用、Noneで均等）
     戻り: dict(fwhm, ramp, a, b, sse)
+
+    スライス厚はエッジで最も効くため、勾配で重み付けすると平坦部の過平滑化を
+    避けて真のFWHMに収束しやすい。
     """
     def objective(params):
         fwhm, ramp = params
         w = trapezoid_weights(offsets, fwhm, ramp)
         sim = w @ Pmat                          # (N,)
-        a, b = _fit_ab(sim, y)
+        a, b = _fit_ab(sim, y, pix_w)
         resid = a * sim + b - y
-        return float(resid @ resid)
+        if pix_w is None:
+            return float(resid @ resid)
+        return float((pix_w * resid * resid).sum())
 
     # 粗いグリッドから初期値 → 局所最適化
     best = None
@@ -133,7 +147,7 @@ def fit_profile(Pmat: np.ndarray, y: np.ndarray, offsets: np.ndarray,
     ramp = max(0.0, min(ramp, fwhm / 2.0))
     w = trapezoid_weights(offsets, fwhm, ramp)
     sim = w @ Pmat
-    a, b = _fit_ab(sim, y)
+    a, b = _fit_ab(sim, y, pix_w)
     return dict(fwhm=float(fwhm), ramp=float(ramp), a=float(a), b=float(b),
                 sse=float(res.fun))
 
@@ -415,7 +429,7 @@ def qa_dump(qa_dir: str, sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
 def calibrate(dir3d: str, dir2d: str, pattern: str,
               out_ssp: str, max_fit_slices: int, pixel_budget: int,
               fg_percentile: float, qa_dir: str | None = None,
-              fit_inplane: bool = False):
+              fit_inplane: bool = False, edge_weight: bool = True):
     s3d = load_series(dir3d, pattern)
     s2d = load_series(dir2d, pattern)
     Ainv = np.linalg.inv(input_affine(s3d))
@@ -433,7 +447,7 @@ def calibrate(dir3d: str, dir2d: str, pattern: str,
     idx = np.linspace(0, n2d - 1, min(max_fit_slices, n2d)).round().astype(int)
     idx = np.unique(idx)
 
-    cols, ys = [], []
+    cols, ys, ws = [], [], []
     rng = np.random.default_rng(0)
     for k in idx:
         ds = s2d.datasets[k]
@@ -443,6 +457,8 @@ def calibrate(dir3d: str, dir2d: str, pattern: str,
         real = real * slope + inter
         base, n = plane_grid(ds)
         planes = sample_planes(s3d.volume, Ainv, base, n, offsets)  # (T,R,C)
+        # エッジ重み（勾配強度）: 平坦部の過平滑化を防ぐ
+        gmag = gaussian_gradient_magnitude(real, 1.0)
 
         thr = np.percentile(real, fg_percentile)
         mask = real > thr
@@ -457,16 +473,24 @@ def calibrate(dir3d: str, dir2d: str, pattern: str,
         Pmat = planes.reshape(offsets.size, -1)[:, fg]    # (T, n)
         cols.append(Pmat)
         ys.append(real.ravel()[fg])
+        ws.append(gmag.ravel()[fg])
 
     Pmat = np.concatenate(cols, axis=1)
     y = np.concatenate(ys)
-    print(f"[fit ] slices={idx.size} offsets={offsets.size} pixels={y.size}")
+    pix_w = None
+    if edge_weight:
+        pix_w = np.concatenate(ws)
+        pix_w = pix_w / (pix_w.mean() + 1e-9)             # 平均1に正規化
+    print(f"[fit ] slices={idx.size} offsets={offsets.size} pixels={y.size} "
+          f"edge_weight={edge_weight}")
 
-    fit = fit_profile(Pmat, y, offsets, nominal)
+    fit = fit_profile(Pmat, y, offsets, nominal, pix_w)
     # 矩形(公称厚)ベースラインとの比較
     w_rect = trapezoid_weights(offsets, nominal, 0.0)
-    sim_r = w_rect @ Pmat; a_r, b_r = _fit_ab(sim_r, y)
-    sse_rect = float(np.sum((a_r * sim_r + b_r - y) ** 2))
+    sim_r = w_rect @ Pmat; a_r, b_r = _fit_ab(sim_r, y, pix_w)
+    resid_r = a_r * sim_r + b_r - y
+    sse_rect = float((resid_r ** 2).sum() if pix_w is None
+                     else (pix_w * resid_r ** 2).sum())
 
     print("\n=== Fitted slice profile (trapezoid) ===")
     print(f"  FWHM         : {fit['fwhm']:.2f} mm   (nominal {nominal:.2f})")
@@ -586,6 +610,9 @@ def main() -> None:
                     help="診断出力先(sim/real/diff画像・残差シフト・線形/単調相関・幾何照合)")
     ap.add_argument("--fit-inplane", action="store_true",
                     help="面内ガウシアンPSF σ を SSP と同時推定（面内解像度差の較正）")
+    ap.add_argument("--edge-weight", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="勾配でエッジ重み付けfit（平坦部の過平滑化を防ぐ。既定ON）")
     ap.add_argument("--self-test", action="store_true",
                     help="既知SSPの復元テスト(dir2d不要)")
     args = ap.parse_args()
@@ -597,7 +624,7 @@ def main() -> None:
         ap.error("dir2d が必要です（--self-test を除く）")
     calibrate(args.dir3d, args.dir2d, args.pattern, args.out_ssp,
               args.max_fit_slices, args.pixel_budget, args.fg_percentile,
-              args.qa_dir, args.fit_inplane)
+              args.qa_dir, args.fit_inplane, args.edge_weight)
 
 
 if __name__ == "__main__":
