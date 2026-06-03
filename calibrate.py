@@ -37,7 +37,7 @@ import os
 
 import numpy as np
 import pydicom
-from scipy.ndimage import map_coordinates, uniform_filter
+from scipy.ndimage import map_coordinates, uniform_filter, gaussian_filter
 from scipy.optimize import minimize_scalar, minimize
 from scipy.stats import spearmanr
 
@@ -136,6 +136,69 @@ def fit_profile(Pmat: np.ndarray, y: np.ndarray, offsets: np.ndarray,
     a, b = _fit_ab(sim, y)
     return dict(fwhm=float(fwhm), ramp=float(ramp), a=float(a), b=float(b),
                 sse=float(res.fun))
+
+
+def fit_profile_inplane(s3d: Series, s2d: Series, Ainv: np.ndarray,
+                        offsets: np.ndarray, nominal: float,
+                        fg_percentile: float, n_slices: int = 3,
+                        ds_factor: int = 2, init=None):
+    """
+    面内ガウシアンPSF σ を SSP と同時推定する。
+    real2D ≈ a·[ Gauss(σ) ∘ Σ_t w(t)·S3D(plane+t·n) ] + b
+    全画像が要るので少数スライスを ds_factor で間引いた解像度で当てはめる。
+    返り値 dict(fwhm, ramp, sigma_mm, a, b, r0, r1)
+      r0: σ=0(面内ボケ無し)の相関 / r1: 最適σでの相関
+    """
+    n2d = len(s2d.datasets)
+    idx = np.unique(np.linspace(0, n2d - 1, min(n_slices, n2d)).round().astype(int))
+    data = []
+    for k in idx:
+        ds = s2d.datasets[k]
+        real = (ds.pixel_array.astype(np.float64)
+                * float(getattr(ds, "RescaleSlope", 1) or 1)
+                + float(getattr(ds, "RescaleIntercept", 0) or 0))
+        base, n = plane_grid(ds)
+        planes = sample_planes(s3d.volume, Ainv, base, n, offsets)  # (T,R,C)
+        planes = planes[:, ::ds_factor, ::ds_factor]
+        real = real[::ds_factor, ::ds_factor]
+        mask = real > np.percentile(real, fg_percentile)
+        ps_ds = float(ds.PixelSpacing[0]) * ds_factor
+        data.append((planes, real, mask, ps_ds))
+
+    def assemble(fwhm, ramp, sigma_px):
+        w = trapezoid_weights(offsets, fwhm, ramp)
+        xs, ys = [], []
+        for planes, real, mask, _ in data:
+            comb = np.tensordot(w, planes, axes=(0, 0))
+            if sigma_px > 1e-3:
+                comb = gaussian_filter(comb, sigma_px)
+            xs.append(comb[mask]); ys.append(real[mask])
+        return np.concatenate(xs), np.concatenate(ys)
+
+    def objective(p):
+        fwhm, ramp, sigma_px = p
+        if fwhm <= 0 or ramp < 0 or sigma_px < 0:
+            return 1e18
+        x, y = assemble(fwhm, ramp, min(sigma_px, 6.0))
+        a, b = _fit_ab(x, y)
+        r = a * x + b - y
+        return float(r @ r)
+
+    f0, r0p = (init or (nominal, 0.0))[0], (init or (nominal, 0.0))[1]
+    res = minimize(objective, x0=[f0, r0p, 0.8], method="Nelder-Mead",
+                   options=dict(xatol=1e-3, fatol=1e-6, maxiter=800))
+    fwhm, ramp, sigma_px = res.x
+    ramp = max(0.0, min(ramp, fwhm / 2.0)); sigma_px = max(0.0, sigma_px)
+    ps_ds = data[0][3]
+
+    x0, y0 = assemble(fwhm, ramp, 0.0)
+    x1, y1 = assemble(fwhm, ramp, sigma_px)
+    a0, b0 = _fit_ab(x0, y0); a1, b1 = _fit_ab(x1, y1)
+    r0 = float(np.corrcoef(a0 * x0 + b0, y0)[0, 1])
+    r1 = float(np.corrcoef(a1 * x1 + b1, y1)[0, 1])
+    return dict(fwhm=float(fwhm), ramp=float(ramp),
+                sigma_mm=float(sigma_px * ps_ds), a=float(a1), b=float(b1),
+                r0=r0, r1=r1)
 
 
 # --------------------------------------------------------------------------- #
@@ -281,7 +344,8 @@ def qa_dump(qa_dir: str, sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
 # --------------------------------------------------------------------------- #
 def calibrate(dir3d: str, dir2d: str, pattern: str,
               out_ssp: str, max_fit_slices: int, pixel_budget: int,
-              fg_percentile: float, qa_dir: str | None = None):
+              fg_percentile: float, qa_dir: str | None = None,
+              fit_inplane: bool = False):
     s3d = load_series(dir3d, pattern)
     s2d = load_series(dir2d, pattern)
     Ainv = np.linalg.inv(input_affine(s3d))
@@ -341,6 +405,18 @@ def calibrate(dir3d: str, dir2d: str, pattern: str,
     print(f"  SSE  fitted  : {fit['sse']:.3e}")
     print(f"  SSE  rect    : {sse_rect:.3e}   (improvement "
           f"{100*(1-fit['sse']/sse_rect):.1f}%)")
+
+    # 面内PSFを同時推定（オプション）
+    if fit_inplane:
+        ip = fit_profile_inplane(s3d, s2d, Ainv, offsets, nominal, fg_percentile,
+                                 init=(fit['fwhm'], fit['ramp']))
+        print("\n=== Joint fit with in-plane PSF ===")
+        print(f"  FWHM         : {ip['fwhm']:.2f} mm   (nominal {nominal:.2f})")
+        print(f"  ramp(edge)   : {ip['ramp']:.2f} mm")
+        print(f"  in-plane σ   : {ip['sigma_mm']:.2f} mm  (面内ガウシアンPSF)")
+        print(f"  r  σ=0 -> σ* : {ip['r0']:.4f} -> {ip['r1']:.4f}")
+        fit.update(sigma_mm=ip['sigma_mm'], fwhm_joint=ip['fwhm'],
+                   ramp_joint=ip['ramp'], r_inplane=ip['r1'])
 
     # SSP保存（offset, weight）
     w_fit = trapezoid_weights(offsets, fit['fwhm'], fit['ramp'])
@@ -438,6 +514,8 @@ def main() -> None:
                     help="前景マスクのしきい値パーセンタイル")
     ap.add_argument("--qa-dir", default=None,
                     help="診断出力先(sim/real/diff画像・残差シフト・線形/単調相関・幾何照合)")
+    ap.add_argument("--fit-inplane", action="store_true",
+                    help="面内ガウシアンPSF σ を SSP と同時推定（面内解像度差の較正）")
     ap.add_argument("--self-test", action="store_true",
                     help="既知SSPの復元テスト(dir2d不要)")
     args = ap.parse_args()
@@ -449,7 +527,7 @@ def main() -> None:
         ap.error("dir2d が必要です（--self-test を除く）")
     calibrate(args.dir3d, args.dir2d, args.pattern, args.out_ssp,
               args.max_fit_slices, args.pixel_budget, args.fg_percentile,
-              args.qa_dir)
+              args.qa_dir, args.fit_inplane)
 
 
 if __name__ == "__main__":

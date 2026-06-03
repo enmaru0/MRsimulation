@@ -40,7 +40,7 @@ from typing import Callable
 import numpy as np
 import pydicom
 from pydicom.uid import generate_uid
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, gaussian_filter
 
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +78,12 @@ PROFILES = {
     "rect": rect_profile,
     "gaussian": gaussian_profile,
 }
+
+
+def apply_inplane_blur(vol: np.ndarray, sigma_mm: float, ps: list) -> np.ndarray:
+    """各スライスに面内ガウシアンPSFを適用（σはmm、面内のみ・スライス間は不変）。"""
+    sig = (0.0, sigma_mm / float(ps[0]), sigma_mm / float(ps[1]))
+    return gaussian_filter(vol, sigma=sig)
 
 
 def measured_profile(ssp_file: str):
@@ -404,7 +410,8 @@ def simulate(in_dir: str,
              orientation: str = "native",
              in_plane_spacing: float | None = None,
              recon_step: float | None = None,
-             ssp_file: str | None = None) -> None:
+             ssp_file: str | None = None,
+             in_plane_blur: float = 0.0) -> None:
     series = load_series(in_dir, pattern)
     dz_in = float(np.median(np.diff(series.positions)))
     ps_in = [float(x) for x in series.template.PixelSpacing]
@@ -430,8 +437,11 @@ def simulate(in_dir: str,
         W = build_weights(series.positions, centers, profile, support)
         nz, ny, nx = series.volume.shape
         out = (W @ series.volume.reshape(nz, ny * nx)).reshape(-1, ny, nx)
+        if in_plane_blur > 0:
+            out = apply_inplane_blur(out, in_plane_blur, ps_in)
         print(f"[sim ] native profile={profile_name} FWHM={thickness}mm "
-              f"support={support}mm -> {centers.size} slices @ {spacing}mm spacing")
+              f"support={support}mm blur={in_plane_blur}mm "
+              f"-> {centers.size} slices @ {spacing}mm spacing")
         write_output(series, centers, out, thickness, spacing, out_dir, series_desc)
     else:
         # AX/COR/SAG: 患者座標系でリスライスしてからプロファイル積分
@@ -443,9 +453,11 @@ def simulate(in_dir: str,
         W = build_weights(d_pos, centers, profile, support)
         K, R, C = V_fine.shape
         out = (W @ V_fine.reshape(K, R * C)).reshape(-1, R, C)
+        if in_plane_blur > 0:
+            out = apply_inplane_blur(out, in_plane_blur, [ips, ips])
         print(f"[sim ] {orientation} profile={profile_name} FWHM={thickness}mm "
-              f"support={support}mm in-plane={ips:.3f}mm recon-step={step:.3f}mm "
-              f"-> {centers.size} slices {R}x{C} @ {spacing}mm spacing")
+              f"support={support}mm blur={in_plane_blur}mm in-plane={ips:.3f}mm "
+              f"recon-step={step:.3f}mm -> {centers.size} slices {R}x{C} @ {spacing}mm spacing")
         write_resliced(series, u, v, n, a_min, b_min, ips,
                        centers, out, thickness, spacing, out_dir, series_desc)
     print(f"[save] {centers.size} files -> {out_dir}")
@@ -476,11 +488,14 @@ def main() -> None:
                     help="リスライス時の法線方向の細刻み [mm] (default: 入力の最小間隔)")
     ap.add_argument("--ssp-file", default=None,
                     help="calibrate.py が出力した実測SSP(.npy)。指定時は --profile/--thickness より優先")
+    ap.add_argument("--in-plane-blur", type=float, default=0.0,
+                    help="面内ガウシアンPSFのσ[mm]。calibrate --fit-inplane の sigma_mm を指定")
     args = ap.parse_args()
 
     simulate(args.input, args.output, args.thickness, args.spacing,
              args.profile, args.support, args.start, args.pattern, args.desc,
-             args.orientation, args.in_plane_spacing, args.recon_step, args.ssp_file)
+             args.orientation, args.in_plane_spacing, args.recon_step, args.ssp_file,
+             args.in_plane_blur)
 
 
 if __name__ == "__main__":

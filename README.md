@@ -100,6 +100,8 @@ python3 -m venv .venv
 | `--orientation` | `native` | 出力面: `native`(入力スライス方向) / `axial` / `coronal` / `sagittal` |
 | `--in-plane-spacing` | 入力最小 | リスライス時の面内画素間隔 [mm] |
 | `--recon-step` | 入力最小 | リスライス時の法線方向の細刻み [mm] |
+| `--ssp-file` | — | `calibrate.py` の実測SSP(.npy)。`--profile`/`--thickness` より優先 |
+| `--in-plane-blur` | `0` | 面内ガウシアンPSFのσ[mm]（`calibrate --fit-inplane` の `sigma_mm`） |
 
 ---
 
@@ -221,7 +223,34 @@ fit画素でのNRMSE/Pearson r）で精度を確認できる。
 | `--pixel-budget` | `60000` | fitに使う総画素数の上限 |
 | `--fg-percentile` | `40` | 前景マスクのしきい値パーセンタイル |
 | `--qa-dir` | — | 診断出力先（sim/real/diff画像・残差シフト・線形/単調相関・幾何照合） |
+| `--fit-inplane` | — | 面内ガウシアンPSF σ を SSP と同時推定（面内解像度差の較正） |
 | `--self-test` | — | 既知SSPの復元テスト（`dir2d` 不要） |
+
+### 面内解像度差の較正 (`--fit-inplane`)
+
+3Dが高解像（例 1024²）で実2Dが低解像の場合、ジオメトリ標本化だけの擬似2Dは
+シャープすぎてエッジが合わず、SSIM/相関が低くなる。`--fit-inplane` はフォワードモデルに
+面内ガウシアンPSFを加えて σ を SSP と同時推定する:
+
+```
+real2D ≈ a · [ Gauss_inplane(σ) ∘ Σ_t w(t)·S3D(plane + t·n) ] + b
+```
+
+```bash
+.venv/bin/python calibrate.py <実3D> <実2D> --fit-inplane --out-ssp ssp.npy
+# => in-plane σ [mm] と、σ=0→σ* での相関改善を表示
+```
+
+推定された `in-plane σ` を本体に渡して、面内ボケ込みの擬似2Dを生成する:
+
+```bash
+.venv/bin/python mri_slice_sim.py <実3D> out_calib \
+    --spacing 6 --thickness 3 --ssp-file ssp.npy --in-plane-blur <σ_mm>
+```
+
+> 補足: SSP推定が公称厚より極端に大きく出る（例 nominal 3mm に対し FWHM≈9mm）場合、
+> 面内解像度差を厚み方向で代理しているサイン。`--fit-inplane` を併用すると SSP は
+> 公称付近へ戻り、信頼できる値になる。
 
 ### 一致が低いときの診断 (`--qa-dir`)
 
