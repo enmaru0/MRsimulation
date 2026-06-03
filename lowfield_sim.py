@@ -150,19 +150,24 @@ def kspace_truncate(img: np.ndarray, keep: float) -> np.ndarray:
 
 
 def resolution_downup(img: np.ndarray, factor: float,
-                      rng: np.random.Generator, sigma: float) -> np.ndarray:
-    """factor倍に縮小→(低解像で)Ricianノイズ付加→元サイズへ拡大。
+                      rng: np.random.Generator, sigma: float,
+                      up_order: int = 1):
+    """factor倍に縮小→(低解像で)Ricianノイズ付加→補間で元サイズへ拡大。
 
-    低磁場の大ボクセル取得を模す。ノイズは取得解像度で乗るので縮小後に付加し、
-    拡大で空間相関（実機の低解像ノイズらしさ）が入る。
+    低磁場の大ボクセル取得を模す。間引き前にアンチエイリアス平滑化し、ノイズは取得
+    (低)解像度で乗せ、拡大で空間相関（実機の低解像ノイズらしさ）が入る。
+    返り値 (back, small): back=元サイズへ補間戻し / small=真の低解像画像。
+    up_order: 拡大補間の次数（1=線形, 0=最近傍, 3=3次）。
     """
     if factor >= 1.0:
-        return add_rician(img, sigma, rng)
-    small = zoom(img, factor, order=1)
-    small = add_rician(small, sigma, rng)
+        return add_rician(img, sigma, rng), None
+    # アンチエイリアス: 目標ボクセル幅(=1/factor画素)へ事前平滑化してから間引く
+    pre = gaussian_filter(img, (1.0 / factor) / 2.3548)
+    small = zoom(pre, factor, order=1)
+    small = add_rician(small, sigma, rng)               # ノイズは低解像で付加
     back = zoom(small, (img.shape[0] / small.shape[0],
-                        img.shape[1] / small.shape[1]), order=1)
-    return back
+                        img.shape[1] / small.shape[1]), order=up_order)
+    return back, small
 
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +235,37 @@ def approx_t1_contrast(img: np.ndarray, strength: float) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+def _write_lowres_slice(ds_src, small: np.ndarray, out_dir: str, idx: int,
+                        uid: str, slope: float, intercept: float, desc: str):
+    """真の低解像スライスを、正しいジオメトリ(画素大・FOV保持)でDICOM出力。"""
+    ds = pydicom.dcmread(ds_src.filename)
+    px = _encode_px(ds, small, slope, intercept)
+    old_ps = [float(x) for x in ds.PixelSpacing]
+    R, C = int(ds.Rows), int(ds.Columns)
+    rs, cs = small.shape
+    new_ps = [old_ps[0] * R / rs, old_ps[1] * C / cs]   # FOV保持で画素拡大
+    iop = np.array(ds.ImageOrientationPatient, float)
+    col_dir, row_dir = iop[0:3], iop[3:6]
+    ipp = np.array(ds.ImagePositionPatient, float)
+    # 画素(0,0)中心の移動: 画素が大きくなる分だけ半画素ずらす
+    new_ipp = (ipp + 0.5 * (new_ps[1] - old_ps[1]) * col_dir
+               + 0.5 * (new_ps[0] - old_ps[0]) * row_dir)
+    ds.PixelData = px.tobytes()
+    ds.Rows, ds.Columns = px.shape
+    ds.PixelSpacing = [float(new_ps[0]), float(new_ps[1])]
+    ds.ImagePositionPatient = [float(v) for v in new_ipp]
+    ds.SeriesInstanceUID = uid
+    ds.SOPInstanceUID = generate_uid()
+    if hasattr(ds, "file_meta"):
+        ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+    ds.SeriesDescription = desc + " (lowres)"
+    it = list(getattr(ds, "ImageType", ["DERIVED", "SECONDARY"]))
+    if it and it[0] == "ORIGINAL":
+        it[0] = "DERIVED"
+    ds.ImageType = it
+    ds.save_as(os.path.join(out_dir, f"{idx:05d}.DCM"))
+
+
 def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
                       field_high: float, field_low: float, snr_exp: float,
                       target_snr: float | None, noise_sigma: float | None,
@@ -242,7 +278,9 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
                       contrast_strength: float = 1.0,
                       noise_scale: float = 1.0,
                       noise_corr_mm: float | None = None,
-                      limit: int = 0) -> None:
+                      limit: int = 0,
+                      upsample_order: int = 1,
+                      save_lowres: str | None = None) -> None:
     s = load_series(in_dir, pattern)
     vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
@@ -330,6 +368,9 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
 
     os.makedirs(out_dir, exist_ok=True)
     new_uid = generate_uid()
+    lr_uid = generate_uid()
+    if save_lowres:
+        os.makedirs(save_lowres, exist_ok=True)
     rng = np.random.default_rng(seed)
     slope = float(getattr(s.template, "RescaleSlope", 1) or 1)
     intercept = float(getattr(s.template, "RescaleIntercept", 0) or 0)
@@ -344,7 +385,11 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         if kspace_keep < 1.0:
             img = kspace_truncate(img, kspace_keep)
         if downsample < 1.0:
-            img = resolution_downup(img, downsample, rng, sigma_add)
+            img, small = resolution_downup(img, downsample, rng, sigma_add,
+                                           up_order=upsample_order)
+            if save_lowres and small is not None:
+                _write_lowres_slice(ds, small, save_lowres, k + 1, lr_uid,
+                                    slope, intercept, desc)
         else:
             img = add_rician(img, sigma_add, rng, noise_corr_px)
 
@@ -363,7 +408,9 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         ds.ImageType = it
         ds.save_as(os.path.join(out_dir, f"{k + 1:05d}.DCM"))
 
-    print(f"[save] {len(s.datasets)} files -> {out_dir}")
+    n_written = min(limit, len(s.datasets)) if limit else len(s.datasets)
+    print(f"[save] {n_written} files -> {out_dir}"
+          + (f"  (+ lowres -> {save_lowres})" if save_lowres else ""))
 
 
 def main() -> None:
@@ -408,6 +455,10 @@ def main() -> None:
                     help="ノイズの空間相関長[mm]（粗さ。無参照調整用。例: 取得ボクセル相当1.5）")
     ap.add_argument("--limit", type=int, default=0,
                     help="先頭Nスライスだけ生成（>0で素早く目視確認）")
+    ap.add_argument("--upsample-order", type=int, default=1, choices=[0, 1, 3],
+                    help="--downsample の拡大補間（1=線形[既定], 0=最近傍, 3=3次）")
+    ap.add_argument("--save-lowres", default=None,
+                    help="真の低解像DICOM(小マトリクス)も別フォルダに出力（--downsample時）")
     args = ap.parse_args()
 
     simulate_lowfield(args.input, args.output, args.pattern,
@@ -416,7 +467,8 @@ def main() -> None:
                       args.blur_mm, args.in_plane_res, args.kspace_keep,
                       args.downsample, args.t1_strength, args.seed, args.desc,
                       args.profile, args.blur_scale, args.contrast_strength,
-                      args.noise_scale, args.noise_corr_mm, args.limit)
+                      args.noise_scale, args.noise_corr_mm, args.limit,
+                      args.upsample_order, args.save_lowres)
 
 
 if __name__ == "__main__":
