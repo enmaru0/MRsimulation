@@ -220,7 +220,31 @@ fit画素でのNRMSE/Pearson r）で精度を確認できる。
 | `--max-fit-slices` | `11` | fitに使う2D枚数（中央から等間隔抽出） |
 | `--pixel-budget` | `60000` | fitに使う総画素数の上限 |
 | `--fg-percentile` | `40` | 前景マスクのしきい値パーセンタイル |
+| `--qa-dir` | — | 診断出力先（sim/real/diff画像・残差シフト・線形/単調相関・幾何照合） |
 | `--self-test` | — | 既知SSPの復元テスト（`dir2d` 不要） |
+
+### 一致が低いときの診断 (`--qa-dir`)
+
+`--self-test` が PASS なのに実ペアで `r` / SSIM が低い場合、ツールではなく
+**モデルと実データの食い違い**が原因。`--qa-dir qa/` を付けると診断材料を出力する:
+
+```bash
+.venv/bin/python calibrate.py <実3D> <実2D> --qa-dir qa/
+# qa/compare.png (real / sim / 差分 / 結合ヒストグラム) ※matplotlib必要
+# qa/geometry.txt, qa/diagnostics.txt, qa/{real,sim,diff}.npy
+```
+
+読み方:
+
+| 兆候 | 解釈 | 対処 |
+|---|---|---|
+| `FrameOfReferenceUID 3D==2D : False` | 別座標系。IPP/IOPの直接対応が無効 | 剛体レジストレーションが必須 |
+| 残差シフト `|shift|>1px` | 位置ずれ/体動 | レジストレーションで補正 |
+| Spearman ≫ Pearson | 単調な非線形コントラスト差 | 強度マップを線形→単調へ高度化 |
+| 両方低い | 位置ずれ or 面内解像度差(PSF/Gibbs) | レジストレーション／面内PSF較正 |
+
+> `compare.png` の出力には matplotlib が必要（`pip install matplotlib`）。無い場合は
+> `.npy` 配列と診断テキストのみ保存される。
 
 > 注: `--ssp-file` 使用時は `--thickness` も指定すると、出力DICOMの `SliceThickness`
 > タグが公称厚に一致する（SSP自体は実測形状を使う）。

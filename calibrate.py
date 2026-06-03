@@ -39,6 +39,7 @@ import numpy as np
 import pydicom
 from scipy.ndimage import map_coordinates, uniform_filter
 from scipy.optimize import minimize_scalar, minimize
+from scipy.stats import spearmanr
 
 from mri_slice_sim import load_series, input_affine, Series
 
@@ -166,9 +167,115 @@ def ssim(sim: np.ndarray, ref: np.ndarray, win: int = 7) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# 診断 (--qa-dir)
+# --------------------------------------------------------------------------- #
+def estimate_shift(ref: np.ndarray, mov: np.ndarray):
+    """位相相関で ref に対する mov の面内シフト(drow, dcol)[画素]を推定。"""
+    F = np.fft.fft2(ref - ref.mean())
+    G = np.fft.fft2(mov - mov.mean())
+    R = F * np.conj(G)
+    R /= np.abs(R) + 1e-9
+    corr = np.fft.ifft2(R).real
+    peak = np.array(np.unravel_index(np.argmax(corr), corr.shape), float)
+    for i, dim in enumerate(corr.shape):
+        if peak[i] > dim // 2:
+            peak[i] -= dim
+    return peak  # (drow, dcol)
+
+
+def geometry_report(s3d: Series, s2d: Series) -> str:
+    """FrameOfReference / 向き / 範囲の整合性を文字列で返す。"""
+    lines = []
+    f3 = getattr(s3d.template, "FrameOfReferenceUID", None)
+    f2 = getattr(s2d.template, "FrameOfReferenceUID", None)
+    lines.append(f"FrameOfReferenceUID 3D == 2D : {f3 == f2}")
+    if f3 != f2:
+        lines.append("  !! 異なる基準座標系 → IPP/IOPの直接対応は無効。レジストレーション必須。")
+    iop3 = [round(float(x), 3) for x in s3d.template.ImageOrientationPatient]
+    iop2 = [round(float(x), 3) for x in s2d.template.ImageOrientationPatient]
+    lines.append(f"IOP 3D : {iop3}")
+    lines.append(f"IOP 2D : {iop2}")
+    # 3Dの世界座標バウンディングbox
+    A = input_affine(s3d)
+    K, R, C = s3d.volume.shape
+    corners = np.array([A @ [c, r, k, 1.0]
+                        for k in (0, K - 1) for r in (0, R - 1)
+                        for c in (0, C - 1)])[:, :3]
+    lo, hi = corners.min(0), corners.max(0)
+    lines.append(f"3D world bbox  X[{lo[0]:.1f},{hi[0]:.1f}] "
+                 f"Y[{lo[1]:.1f},{hi[1]:.1f}] Z[{lo[2]:.1f},{hi[2]:.1f}] (LPS mm)")
+    ipps = np.array([list(map(float, d.ImagePositionPatient)) for d in s2d.datasets])
+    p_lo, p_hi = ipps.min(0), ipps.max(0)
+    lines.append(f"2D IPP range   X[{p_lo[0]:.1f},{p_hi[0]:.1f}] "
+                 f"Y[{p_lo[1]:.1f},{p_hi[1]:.1f}] Z[{p_lo[2]:.1f},{p_hi[2]:.1f}]")
+    inside = np.all((ipps >= lo - 5) & (ipps <= hi + 5), axis=1).mean()
+    lines.append(f"2D origin が3D範囲内の割合 : {100*inside:.0f}%  "
+                 "(低い→位置ずれ/別座標系)")
+    return "\n".join(lines)
+
+
+def qa_dump(qa_dir: str, sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
+            ps: list, geom: str):
+    """sim/real/diff の保存と数値診断。matplotlibがあればPNGも。"""
+    os.makedirs(qa_dir, exist_ok=True)
+    np.save(os.path.join(qa_dir, "real.npy"), real)
+    np.save(os.path.join(qa_dir, "sim.npy"), sim)
+    np.save(os.path.join(qa_dir, "diff.npy"), sim - real)
+    with open(os.path.join(qa_dir, "geometry.txt"), "w") as f:
+        f.write(geom + "\n")
+
+    # 残差シフト（位置ずれ診断）
+    drow, dcol = estimate_shift(real, sim)
+    shift_mm = (drow * ps[0], dcol * ps[1])
+    # 線形 vs 単調（コントラスト非線形性の診断）
+    x, y = sim[mask], real[mask]
+    r_lin = float(np.corrcoef(x, y)[0, 1])
+    r_mono = float(spearmanr(x, y).statistic)
+
+    report = [
+        geom,
+        "",
+        f"residual in-plane shift : drow={drow:.1f}px dcol={dcol:.1f}px "
+        f"=> ({shift_mm[0]:.2f}, {shift_mm[1]:.2f}) mm",
+        "   |shift|>1px は位置ずれ/レジストレーション不足を示唆",
+        f"Pearson r (linear)   : {r_lin:.4f}",
+        f"Spearman r (monotone): {r_mono:.4f}",
+        "   r_mono >> r_lin なら単調な非線形コントラスト差 → 強度マップの高度化で改善",
+        "   両方低いなら 位置ずれ / 面内解像度差(PSF/Gibbs) が主因",
+    ]
+    txt = "\n".join(report)
+    with open(os.path.join(qa_dir, "diagnostics.txt"), "w") as f:
+        f.write(txt + "\n")
+    print("\n=== QA diagnostics ===")
+    print(txt)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        vmax = np.percentile(real[mask], 99)
+        d = sim - real
+        dmax = np.percentile(np.abs(d[mask]), 99)
+        fig, ax = plt.subplots(2, 2, figsize=(10, 10))
+        ax[0, 0].imshow(real, cmap="gray", vmin=0, vmax=vmax); ax[0, 0].set_title("real 2D")
+        ax[0, 1].imshow(sim, cmap="gray", vmin=0, vmax=vmax); ax[0, 1].set_title("simulated 2D")
+        ax[1, 0].imshow(d, cmap="bwr", vmin=-dmax, vmax=dmax); ax[1, 0].set_title("sim - real")
+        ax[1, 1].hist2d(x, y, bins=128); ax[1, 1].set_xlabel("sim"); ax[1, 1].set_ylabel("real")
+        ax[1, 1].set_title("joint histogram")
+        for a in ax.ravel()[:3]:
+            a.axis("off")
+        fig.tight_layout()
+        fig.savefig(os.path.join(qa_dir, "compare.png"), dpi=110)
+        plt.close(fig)
+        print(f"[qa  ] images -> {qa_dir}/compare.png, *.npy, diagnostics.txt")
+    except Exception as e:
+        print(f"[qa  ] matplotlib無し: 配列(.npy)と診断テキストのみ保存 ({e})")
+
+
+# --------------------------------------------------------------------------- #
 def calibrate(dir3d: str, dir2d: str, pattern: str,
               out_ssp: str, max_fit_slices: int, pixel_budget: int,
-              fg_percentile: float):
+              fg_percentile: float, qa_dir: str | None = None):
     s3d = load_series(dir3d, pattern)
     s2d = load_series(dir2d, pattern)
     Ainv = np.linalg.inv(input_affine(s3d))
@@ -257,6 +364,10 @@ def calibrate(dir3d: str, dir2d: str, pattern: str,
     print(f"  NRMSE : {nrmse(sim_img, real, mask):.4f}")
     print(f"  r     : {pearson(sim_img, real, mask):.4f}")
     print(f"  SSIM  : {ssim(sim_img, real):.4f}")
+
+    if qa_dir:
+        ps = [float(x) for x in ds.PixelSpacing]
+        qa_dump(qa_dir, sim_img, real, mask, ps, geometry_report(s3d, s2d))
     return fit
 
 
@@ -319,6 +430,8 @@ def main() -> None:
     ap.add_argument("--pixel-budget", type=int, default=60000, help="fit総画素数の上限")
     ap.add_argument("--fg-percentile", type=float, default=40.0,
                     help="前景マスクのしきい値パーセンタイル")
+    ap.add_argument("--qa-dir", default=None,
+                    help="診断出力先(sim/real/diff画像・残差シフト・線形/単調相関・幾何照合)")
     ap.add_argument("--self-test", action="store_true",
                     help="既知SSPの復元テスト(dir2d不要)")
     args = ap.parse_args()
@@ -329,7 +442,8 @@ def main() -> None:
     if not args.dir2d:
         ap.error("dir2d が必要です（--self-test を除く）")
     calibrate(args.dir3d, args.dir2d, args.pattern, args.out_ssp,
-              args.max_fit_slices, args.pixel_budget, args.fg_percentile)
+              args.max_fit_slices, args.pixel_budget, args.fg_percentile,
+              args.qa_dir)
 
 
 if __name__ == "__main__":
