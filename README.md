@@ -392,6 +392,32 @@ python lowfield_sim.py high_FLAIR out_FLAIR --profile prof_FLAIR.json --pattern 
 `--profile` 指定時は `target_snr`・`resolution_mm`・`intensity_quantiles` が
 `--field-*`/`--blur-mm`/`--t1-strength` より優先される（`--blur-mm` はさらに上乗せ可）。
 
+### 解像度ノブ（`--downsample` / `--kspace-keep` / `--blur-mm`）の決め方
+
+この3つは **同じ「解像度比 ρ = res_high / res_low」を別表現したもの**。低磁場ほど粗いので
+0<ρ<1（例: 高磁場1mm・低磁場2mm → ρ=0.5）。
+
+| ノブ | ρからの換算 | アーチファクト | いつ使う |
+|---|---|---|---|
+| `--blur-mm` (σ) | σ = √(res_low²−res_high²)/2.355 | 滑らかなボケ | 再構成フィルタ/T2ブラー的劣化、微調整 |
+| `--kspace-keep` | keep = ρ | **Gibbsリンギング** | 実低磁場にリンギングが見える（低マトリクス取得） |
+| `--downsample` | factor = ρ | 部分容積＋**相関ノイズ** | 大ボクセル取得を最も物理的に再現（学習データ推奨） |
+
+ρ は **取得マトリクスから真の解像度** `res = FOV / AcquisitionMatrix` で求めるのが本筋
+（再構成PixelSpacingはゼロフィル補間で見かけ細かく、真の解像度を反映しないことがある）。
+`lowfield_calibrate.py --high <高磁場の同コントラスト>` を付けると、両者の取得解像度から
+**ρ と各ノブの推奨値を自動算出**して表示・JSONに保存する:
+
+```bash
+python lowfield_calibrate.py real_low_T1 --name T1 --high high_T1 --out prof_T1.json
+#   -> resolution: recon=0.50mm acquired=1.20mm
+#      vs high-field acquired=0.50mm -> ρ=0.42  推奨: --downsample 0.42 | --kspace-keep 0.42 | --blur-mm 1.09
+```
+
+学習データなら `--downsample`(=ρ) を主に、リンギングが見えるなら `--kspace-keep`(=ρ) を併用、
+`--blur-mm` は実低磁場の見た目に合わせる微調整に使う。`--profile` 適用時は profile の
+`resolution_mm`（取得解像度）から `--blur-mm` 相当が自動で入る。
+
 ### 注意・限界
 
 - **コントラスト変換は周辺分布のヒストグラムマッチング**（unpairedで可能な範囲）。

@@ -125,6 +125,26 @@ def resolution_downup(img: np.ndarray, factor: float,
 # --------------------------------------------------------------------------- #
 # 実低磁場プロファイル較正・適用の共有ヘルパ（unpaired・スケール不変量）
 # --------------------------------------------------------------------------- #
+def inplane_resolution_mm(ds) -> tuple[float, float]:
+    """(再構成, 取得) 面内解像度[mm] を返す。
+
+    再構成 = min(PixelSpacing)。取得 = FOV / AcquisitionMatrix（最も粗い方向）で、
+    ゼロフィル補間で見かけ細かい場合でも真の取得解像度を反映する。タグが無ければ
+    取得=再構成にフォールバック。
+    """
+    ps = [float(x) for x in ds.PixelSpacing]
+    recon = float(min(ps))
+    rows, cols = int(ds.Rows), int(ds.Columns)
+    fov = max(ps[0] * rows, ps[1] * cols)
+    acq = recon
+    am = getattr(ds, "AcquisitionMatrix", None)
+    if am:
+        vals = [int(v) for v in am if int(v) > 0]
+        if vals:
+            acq = float(fov / min(vals))      # 最も粗い方向 ≈ 実効解像度
+    return recon, max(acq, recon)
+
+
 def foreground_mask(img: np.ndarray, pct: float = 55.0) -> np.ndarray:
     return img > np.percentile(img, pct)
 
