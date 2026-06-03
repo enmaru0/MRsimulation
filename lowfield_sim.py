@@ -280,11 +280,18 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
                       noise_corr_mm: float | None = None,
                       limit: int = 0,
                       upsample_order: int = 1,
-                      save_lowres: str | None = None) -> None:
+                      save_lowres: str | None = None,
+                      downsample_to_mm: float | None = None) -> None:
     s = load_series(in_dir, pattern)
     vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
     noise_corr_px = 0.0          # ノイズの空間相関長[出力画素]（0=白色）
+
+    # 目標解像度[mm]からρを自動算出（ρ手計算が不要）: ρ = 入力ps / 目標mm
+    if downsample_to_mm is not None and downsample_to_mm > min(ps):
+        downsample = min(1.0, min(ps) / downsample_to_mm)
+        print(f"[res ] downsample-to {downsample_to_mm}mm "
+              f"(入力{min(ps):.2f}mm) -> ρ={downsample:.3f}")
 
     # 実低磁場プロファイル（lowfield_calibrate.py 出力）を適用
     if profile is not None:
@@ -459,6 +466,9 @@ def main() -> None:
                     help="--downsample の拡大補間（1=線形[既定], 0=最近傍, 3=3次）")
     ap.add_argument("--save-lowres", default=None,
                     help="真の低解像DICOM(小マトリクス)も別フォルダに出力（--downsample時）")
+    ap.add_argument("--downsample-to-mm", type=float, default=None,
+                    help="目標の取得解像度[mm]を直接指定（ρ=入力ps/目標mmを自動算出）。"
+                         "実低磁場の calibrate acquired 値を渡せばよい")
     args = ap.parse_args()
 
     simulate_lowfield(args.input, args.output, args.pattern,
@@ -468,7 +478,7 @@ def main() -> None:
                       args.downsample, args.t1_strength, args.seed, args.desc,
                       args.profile, args.blur_scale, args.contrast_strength,
                       args.noise_scale, args.noise_corr_mm, args.limit,
-                      args.upsample_order, args.save_lowres)
+                      args.upsample_order, args.save_lowres, args.downsample_to_mm)
 
 
 if __name__ == "__main__":

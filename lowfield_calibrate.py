@@ -93,12 +93,19 @@ def calibrate_profile(low_dir: str, pattern: str, name: str,
     # 高磁場が与えられたら解像度ノブの推奨値を算出して表示・保存
     if high_dir:
         sh = load_series(high_dir, pattern)
-        _, res_high = inplane_resolution_mm(sh.template)
+        recon_high, res_high = inplane_resolution_mm(sh.template)
         rec = recommend_knobs(resolution_mm, res_high)
-        prof["recommended"] = {"res_high_mm": round(res_high, 3), **rec}
-        print(f"  vs high-field acquired={res_high:.2f}mm -> ρ={rec['rho']}  "
-              f"推奨: --downsample {rec['downsample']} | "
-              f"--kspace-keep {rec['kspace_keep']} | --blur-mm {rec['blur_mm']}")
+        # --downsample のρは高磁場の「再構成ps」基準（実際に間引く格子）
+        rho_ds = round(min(1.0, recon_high / resolution_mm), 3)
+        prof["recommended"] = {"res_high_mm": round(res_high, 3),
+                               "recon_high_mm": round(recon_high, 3),
+                               "downsample_to_mm": round(resolution_mm, 2),
+                               "downsample": rho_ds, **{k: v for k, v in rec.items()
+                                                        if k != "downsample"}}
+        print(f"  vs high-field: acquired={res_high:.2f}mm recon={recon_high:.2f}mm")
+        print(f"  推奨(解像度): --downsample-to-mm {resolution_mm:.2f}  "
+              f"（または --downsample {rho_ds}）")
+        print(f"  推奨(代替): --kspace-keep {rec['kspace_keep']} | --blur-mm {rec['blur_mm']}")
 
     print(f"  intensity quantiles (norm): "
           f"min={q_norm[0]:.2f} med={q_norm[nq//2]:.2f} max={q_norm[-1]:.2f}")

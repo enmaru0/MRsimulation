@@ -362,6 +362,7 @@ done
 | `--in-plane-res` | — | 目標面内解像度[mm]（等価ボケに換算） |
 | `--kspace-keep` | `1.0` | k空間中央の保持割合(0-1]。<1でGibbs/解像度低下 |
 | `--downsample` | `1.0` | 取得解像度の縮小率(0-1]。<1で「縮小→ノイズ→補間で元サイズに戻す」 |
+| `--downsample-to-mm` | — | 目標取得解像度[mm]を直接指定（ρ=入力ps/目標mm を自動算出） |
 | `--upsample-order` | `1` | `--downsample`の拡大補間（1=線形/0=最近傍/3=3次） |
 | `--save-lowres` | — | 真の低解像DICOM(小マトリクス)も別フォルダに出力 |
 | `--t1-strength` | `0` | 低磁場T1短縮の近似強度[0-1]（近似なので注意） |
@@ -449,6 +450,28 @@ python lowfield_sim.py high_T2 out_T2 --downsample 0.5 --save-lowres out_T2_lowr
 `--save-lowres` は小マトリクス（例 512→256, PixelSpacing 2倍, FOV保持, IPP半画素補正）の
 DICOMを別フォルダに出す。`--profile` と併用する場合は profile が ρ を持たないので
 `--downsample` を明示する（profile由来ボケは二重適用を避けて自動で無効化される）。
+
+#### ρ（縮小率）の決め方
+
+`--downsample ρ` は出力ボクセル = 入力PixelSpacing/ρ なので:
+
+$$\rho = \frac{\text{入力(高磁場)の PixelSpacing}}{\text{実低磁場の取得解像度}}$$
+
+ρを手計算する代わりに、**目標解像度[mm]を直接指定**できる（推奨）:
+
+```bash
+# 実低磁場の取得解像度 1.57mm に合わせる（ρは自動算出）
+python lowfield_sim.py high_T2 out_T2 --downsample-to-mm 1.57 --target-snr 8
+```
+
+「実低磁場の取得解像度」は `lowfield_calibrate.py` が `acquired(AcqMatrix)=1.57mm` として出力する。
+`lowfield_calibrate.py --high <高磁場>` を付ければ `推奨: --downsample-to-mm 1.57` まで提示する。
+
+決め方は3通り:
+1. **取得解像度から（推奨）**: calibrateの `acquired` 値を `--downsample-to-mm` に渡す。
+2. **マトリクス比から**: ρ = 実低磁場の取得マトリクス / 高磁場マトリクス（同FOV時）。
+3. **目視（無参照）**: `--limit` で数枚だけ生成し、実低磁場の鮮明さに合うよう `--downsample-to-mm`
+   を増減（小さい目標mm=高精細, 大きい=低精細）。
 
 ### 解像度ノブ（`--downsample` / `--kspace-keep` / `--blur-mm`）の決め方
 
