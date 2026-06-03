@@ -129,10 +129,15 @@ def add_rician(img: np.ndarray, sigma: float, rng: np.random.Generator,
 # --------------------------------------------------------------------------- #
 # 解像度劣化
 # --------------------------------------------------------------------------- #
-def inplane_blur(img: np.ndarray, sigma_mm: float, ps: list) -> np.ndarray:
-    if sigma_mm <= 0:
+def inplane_blur(img: np.ndarray, sigma_mm, ps: list) -> np.ndarray:
+    """面内ガウシアンPSF。sigma_mm はスカラー(等方) or (行σ_mm, 列σ_mm)(異方)。"""
+    if np.isscalar(sigma_mm):
+        sr = sc = float(sigma_mm)
+    else:
+        sr, sc = float(sigma_mm[0]), float(sigma_mm[1])
+    if sr <= 0 and sc <= 0:
         return img
-    return gaussian_filter(img, (sigma_mm / float(ps[0]), sigma_mm / float(ps[1])))
+    return gaussian_filter(img, (sr / float(ps[0]), sc / float(ps[1])))
 
 
 def kspace_truncate(img: np.ndarray, keep: float) -> np.ndarray:
@@ -173,24 +178,35 @@ def resolution_downup(img: np.ndarray, factor: float,
 # --------------------------------------------------------------------------- #
 # 実低磁場プロファイル較正・適用の共有ヘルパ（unpaired・スケール不変量）
 # --------------------------------------------------------------------------- #
-def inplane_resolution_mm(ds) -> tuple[float, float]:
-    """(再構成, 取得) 面内解像度[mm] を返す。
+def acquired_resolution_axes(ds):
+    """軸ごとの (取得解像度, 再構成解像度) [mm] を返す: (acq_row, acq_col),(rec_row, rec_col)。
 
-    再構成 = min(PixelSpacing)。取得 = FOV / AcquisitionMatrix（最も粗い方向）で、
-    ゼロフィル補間で見かけ細かい場合でも真の取得解像度を反映する。タグが無ければ
-    取得=再構成にフォールバック。
+    AcquisitionMatrix=[freq_rows, freq_cols, phase_rows, phase_cols]。周波数/位相それぞれ
+    片方のみ非ゼロ。行軸の取得数 n_row = (freq_rows or phase_rows)、列軸 n_col 同様。
+    取得解像度 = FOV_axis / n_axis（ゼロフィル補間でも真の取得解像度を反映）。
+    異方性取得(例 256x122)では軸ごとに解像度が異なる。タグ無ければ再構成にフォールバック。
     """
-    ps = [float(x) for x in ds.PixelSpacing]
-    recon = float(min(ps))
+    ps = [float(x) for x in ds.PixelSpacing]            # [row, col]
     rows, cols = int(ds.Rows), int(ds.Columns)
-    fov = max(ps[0] * rows, ps[1] * cols)
-    acq = recon
+    rec_row, rec_col = ps[0], ps[1]
+    fov_row, fov_col = ps[0] * rows, ps[1] * cols
+    acq_row, acq_col = rec_row, rec_col
     am = getattr(ds, "AcquisitionMatrix", None)
-    if am:
-        vals = [int(v) for v in am if int(v) > 0]
-        if vals:
-            acq = float(fov / min(vals))      # 最も粗い方向 ≈ 実効解像度
-    return recon, max(acq, recon)
+    if am and len(am) == 4:
+        fr, fc, pr, pc = (int(v) for v in am)
+        n_row = fr if fr > 0 else pr                    # 行軸に沿う取得数
+        n_col = fc if fc > 0 else pc                    # 列軸に沿う取得数
+        if n_row > 0:
+            acq_row = fov_row / n_row
+        if n_col > 0:
+            acq_col = fov_col / n_col
+    return (max(acq_row, rec_row), max(acq_col, rec_col)), (rec_row, rec_col)
+
+
+def inplane_resolution_mm(ds) -> tuple[float, float]:
+    """(再構成, 取得) 面内解像度[mm] のスカラー（取得=最も粗い軸）。後方互換用。"""
+    (acq_r, acq_c), (rec_r, rec_c) = acquired_resolution_axes(ds)
+    return float(min(rec_r, rec_c)), float(max(acq_r, acq_c))
 
 
 def foreground_mask(img: np.ndarray, pct: float = 55.0) -> np.ndarray:
@@ -286,6 +302,7 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
     vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
     noise_corr_px = 0.0          # ノイズの空間相関長[出力画素]（0=白色）
+    blur_axes = None             # 異方ブラー (行σ_mm, 列σ_mm)。Noneで等方
 
     # 目標解像度[mm]からρを自動算出（ρ手計算が不要）: ρ = 入力ps / 目標mm
     if downsample_to_mm is not None and downsample_to_mm > min(ps):
@@ -310,25 +327,32 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         vol = vol * (1.0 - cs) + matched * cs           # コントラスト強度で原画とブレンド
         # 解像度: 取得解像度どうしで比較（高磁場もゼロフィルなら再構成PixelSpacingは過小）
         res_low = float(prof["resolution_mm"])
-        _, res_high = inplane_resolution_mm(s.template)
+        (acq_hr, acq_hc), _ = acquired_resolution_axes(s.template)
         # ノイズ相関長 = 低磁場取得解像度を出力画素で表したもの
         #   （ゼロフィル/低マトリクスの実低磁場ノイズは白色でなくこの長さで粗く相関）
         noise_corr_px = res_low / min(ps)
+        axes = prof.get("resolution_mm_axes")
         if downsample < 1.0:
             # --downsample が解像度低下と相関ノイズを担うので二重適用しない
-            base_blur = 0.0
             noise_corr_px = 0.0
+        elif axes:
+            # 異方取得(例256x122)は軸ごとに正しい解像度へブラー（片軸過剰ボケを防ぐ）
+            rl_r, rl_c = float(axes[0]), float(axes[1])
+            br = res_to_blur_sigma(rl_r, acq_hr) * float(blur_scale) + blur_mm
+            bc = res_to_blur_sigma(rl_c, acq_hc) * float(blur_scale) + blur_mm
+            blur_axes = (br, bc)
         else:
-            base_blur = res_to_blur_sigma(res_low, res_high) * float(blur_scale)
-        blur_mm = max(blur_mm, base_blur)               # --blur-mm でさらに上乗せ可
+            base_blur = res_to_blur_sigma(res_low, max(acq_hr, acq_hc)) * float(blur_scale)
+            blur_mm = max(blur_mm, base_blur)           # --blur-mm でさらに上乗せ可
         # ノイズ: ユーザーが --target-snr/--noise-sigma を明示しなければ profile を使う
         if target_snr is None and noise_sigma is None:
             target_snr = float(prof["target_snr"])
         t1_strength = 0.0                               # コントラストは適用済み
+        blur_desc = (f"blur_axes=({blur_axes[0]:.2f},{blur_axes[1]:.2f})mm"
+                     if blur_axes else f"blur={blur_mm:.2f}mm")
         print(f"[prof] {profile} name={prof.get('name','?')} "
               f"target_snr={target_snr} contrast={cs:.2f} "
-              f"res_low={res_low:.2f}mm res_high={res_high:.2f}mm "
-              f"blur={blur_mm:.2f}mm noise_corr={noise_corr_px:.1f}px")
+              f"res_low={res_low:.2f}mm {blur_desc} noise_corr={noise_corr_px:.1f}px")
 
     # ノイズ相関長を手動指定（無参照での粗さ調整 / profile値の上書き）
     if noise_corr_mm is not None:
@@ -358,7 +382,9 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
     sigma_add = float(np.sqrt(max(sigma_low ** 2 - sigma_high ** 2, 0.0))) * noise_scale
 
     # 解像度ボケσの決定（in_plane_res 指定があれば等価ガウシアン幅へ換算）
-    if in_plane_res is not None and in_plane_res > min(ps):
+    if blur_axes is not None:
+        blur_eff = blur_axes                            # profileからの異方ブラー
+    elif in_plane_res is not None and in_plane_res > min(ps):
         # 取得解像度をFWHMとみなし、追加ボケ = sqrt(res_low^2 - res_high^2)
         fwhm_add = np.sqrt(max(in_plane_res ** 2 - min(ps) ** 2, 0.0))
         blur_eff = blur_mm + fwhm_add / 2.3548
@@ -370,7 +396,9 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
     print(f"[load] {vol.shape[0]} slices {vol.shape[1]}x{vol.shape[2]}, ps={ps}mm")
     print(f"[noise] σ_high≈{sigma_high:.2f} (SNR≈{snr_before:.1f}) -> "
           f"σ_low={sigma_low:.2f} (SNR≈{snr_after:.1f}) via {how}; σ_add={sigma_add:.2f}")
-    print(f"[res ] blur={blur_eff:.2f}mm kspace_keep={kspace_keep} "
+    blur_str = (f"({blur_eff[0]:.2f},{blur_eff[1]:.2f})" if not np.isscalar(blur_eff)
+                else f"{blur_eff:.2f}")
+    print(f"[res ] blur={blur_str}mm kspace_keep={kspace_keep} "
           f"downsample={downsample} noise_corr={noise_corr_px:.1f}px")
 
     os.makedirs(out_dir, exist_ok=True)

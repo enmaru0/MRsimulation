@@ -40,7 +40,7 @@ import numpy as np
 
 from mri_slice_sim import load_series
 from lowfield_sim import (estimate_noise_sigma, signal_level, fg_quantiles,
-                          inplane_resolution_mm)
+                          inplane_resolution_mm, acquired_resolution_axes)
 
 
 def recommend_knobs(res_low: float, res_high: float) -> dict:
@@ -61,8 +61,9 @@ def calibrate_profile(low_dir: str, pattern: str, name: str,
     sig = signal_level(vol)
     target_snr = sig / (sigma + 1e-9)
 
-    # 取得面内解像度（ゼロフィル対応: AcquisitionMatrix由来）
+    # 取得面内解像度（ゼロフィル対応: AcquisitionMatrix由来）。軸ごとも保存（異方取得対応）
     recon_res, resolution_mm = inplane_resolution_mm(s.template)
+    (acq_row, acq_col), _ = acquired_resolution_axes(s.template)
     ps = [float(x) for x in s.template.PixelSpacing]
 
     # コントラスト（前景輝度の正規化分位）
@@ -76,6 +77,7 @@ def calibrate_profile(low_dir: str, pattern: str, name: str,
         "n_slices": int(vol.shape[0]),
         "pixel_spacing": ps,
         "resolution_mm": resolution_mm,
+        "resolution_mm_axes": [float(acq_row), float(acq_col)],
         "recon_resolution_mm": float(recon_res),
         "sigma_measured": float(sigma),
         "signal_level": float(sig),
@@ -85,7 +87,9 @@ def calibrate_profile(low_dir: str, pattern: str, name: str,
 
     print(f"[calib] {name}: {vol.shape[0]} slices  ps={ps}mm")
     print(f"  resolution: recon(PixelSpacing)={recon_res:.2f}mm  "
-          f"acquired(AcqMatrix)={resolution_mm:.2f}mm")
+          f"acquired(AcqMatrix)={resolution_mm:.2f}mm  "
+          f"軸別(行,列)=({acq_row:.2f},{acq_col:.2f})mm"
+          + ("  ← 異方取得" if abs(acq_row - acq_col) > 0.1 else ""))
     print(f"  noise: corner σ={sc:.2f}  laplacian σ={sl:.2f}  "
           f"{'[背景マスク検出→laplacian採用]' if masked else '[corner採用]'}")
     print(f"  -> σ={sigma:.2f}  signal≈{sig:.1f}  target_snr={target_snr:.1f}")
