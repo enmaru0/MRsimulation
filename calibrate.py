@@ -191,10 +191,16 @@ def geometry_report(s3d: Series, s2d: Series) -> str:
     lines.append(f"FrameOfReferenceUID 3D == 2D : {f3 == f2}")
     if f3 != f2:
         lines.append("  !! 異なる基準座標系 → IPP/IOPの直接対応は無効。レジストレーション必須。")
-    iop3 = [round(float(x), 3) for x in s3d.template.ImageOrientationPatient]
-    iop2 = [round(float(x), 3) for x in s2d.template.ImageOrientationPatient]
-    lines.append(f"IOP 3D : {iop3}")
-    lines.append(f"IOP 2D : {iop2}")
+    iop3v = np.array(s3d.template.ImageOrientationPatient, float)
+    iop2v = np.array(s2d.template.ImageOrientationPatient, float)
+    lines.append(f"IOP 3D : {[round(float(x),3) for x in iop3v]}")
+    lines.append(f"IOP 2D : {[round(float(x),3) for x in iop2v]}")
+    # 2D法線 vs 3D法線の角度（奥行き方向の解像度混入を診断）
+    n3 = s3d.normal
+    n2 = np.cross(iop2v[0:3], iop2v[3:6]); n2 /= np.linalg.norm(n2)
+    ang = np.degrees(np.arccos(np.clip(abs(np.dot(n2, n3)), 0, 1)))
+    lines.append(f"2D法線 vs 3D法線の角度 : {ang:.1f}度  "
+                 "(0=同方向で最良/大きいほど3Dの粗い軸が奥行きに混入)")
     # 3Dの世界座標バウンディングbox
     A = input_affine(s3d)
     K, R, C = s3d.volume.shape
