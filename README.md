@@ -390,7 +390,23 @@ python lowfield_sim.py high_FLAIR out_FLAIR --profile prof_FLAIR.json --pattern 
 ```
 
 `--profile` 指定時は `target_snr`・`resolution_mm`・`intensity_quantiles` が
-`--field-*`/`--blur-mm`/`--t1-strength` より優先される（`--blur-mm` はさらに上乗せ可）。
+`--field-*`/`--t1-strength` より優先される。
+
+#### profile設定後の微調整
+
+profileを当てた結果がズレるとき、以下で後調整できる（profileを編集せずCLIで上書き）:
+
+| 調整 | オプション | 用途 |
+|---|---|---|
+| **ボケすぎ/不足** | `--blur-scale`（既定1.0） | profile由来ボケの倍率。ボケすぎなら `0.5` 等、`0` で無効化 |
+| ボケを足す | `--blur-mm` | profile由来ボケに上乗せ |
+| **ノイズ量** | `--target-snr` / `--noise-sigma` | 明示するとprofileのSNRより優先 |
+| **コントラスト強度** | `--contrast-strength`（既定1.0） | `1`=完全に低磁場へ / `0`=原画コントラスト / 中間でブレンド |
+| リンギング | `--kspace-keep` | profileと併用してGibbsを追加 |
+
+> ボケすぎる典型原因は、profileの取得解像度 `resolution_mm` が `AcquisitionMatrix` から
+> 大きめに出るケース。まず `--blur-scale 0.5` 程度から実低磁場の見た目に合わせて調整する。
+> 適用時は高磁場側も**取得解像度**で比較するので、両者ゼロフィルでも過剰ボケになりにくい。
 
 ### 解像度ノブ（`--downsample` / `--kspace-keep` / `--blur-mm`）の決め方
 

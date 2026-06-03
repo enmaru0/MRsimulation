@@ -194,7 +194,9 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
                       blur_mm: float, in_plane_res: float | None,
                       kspace_keep: float, downsample: float,
                       t1_strength: float, seed: int, desc: str,
-                      profile: str | None = None) -> None:
+                      profile: str | None = None,
+                      blur_scale: float = 1.0,
+                      contrast_strength: float = 1.0) -> None:
     s = load_series(in_dir, pattern)
     vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
@@ -211,15 +213,22 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         # 0アンカー: 背景(空気)を0付近に保つ（前景分位だけだと空気が持ち上がる）
         src_q = np.concatenate([[0.0], src_q])
         tgt_q = np.concatenate([[0.0], tgt_q])
-        vol = histogram_match(vol, src_q, tgt_q)
-        # ノイズ・解像度の目標を上書き（解像度は取得PixelSpacing差から安定に換算）
-        target_snr = float(prof["target_snr"])
+        matched = histogram_match(vol, src_q, tgt_q)
+        cs = float(np.clip(contrast_strength, 0.0, 1.0))
+        vol = vol * (1.0 - cs) + matched * cs           # コントラスト強度で原画とブレンド
+        # 解像度: 取得解像度どうしで比較（高磁場もゼロフィルなら再構成PixelSpacingは過小）
         res_low = float(prof["resolution_mm"])
-        blur_mm = max(blur_mm, res_to_blur_sigma(res_low, min(ps)))
+        _, res_high = inplane_resolution_mm(s.template)
+        base_blur = res_to_blur_sigma(res_low, res_high) * float(blur_scale)
+        blur_mm = max(blur_mm, base_blur)               # --blur-mm でさらに上乗せ可
+        # ノイズ: ユーザーが --target-snr/--noise-sigma を明示しなければ profile を使う
+        if target_snr is None and noise_sigma is None:
+            target_snr = float(prof["target_snr"])
         t1_strength = 0.0                               # コントラストは適用済み
         print(f"[prof] {profile} name={prof.get('name','?')} "
-              f"target_snr={target_snr:.1f} res_low={res_low:.2f}mm "
-              f"res_high={min(ps):.2f}mm -> blur={blur_mm:.2f}mm")
+              f"target_snr={target_snr} contrast={cs:.2f} "
+              f"res_low={res_low:.2f}mm res_high={res_high:.2f}mm "
+              f"blur_scale={blur_scale} -> blur={blur_mm:.2f}mm")
 
     sigma_high = estimate_sigma_rayleigh(vol)
     sig = signal_level(vol)
@@ -326,6 +335,11 @@ def main() -> None:
     ap.add_argument("--profile", default=None,
                     help="lowfield_calibrate.py が出力したコントラスト別プロファイル(.json)。"
                          "ノイズ/解像度/コントラストを実低磁場に合わせて上書き")
+    # profile設定後の微調整
+    ap.add_argument("--blur-scale", type=float, default=1.0,
+                    help="profile由来ボケの倍率（ボケすぎなら<1, 例0.5。0で無効化）")
+    ap.add_argument("--contrast-strength", type=float, default=1.0,
+                    help="コントラスト変換の強度[0-1]（1=完全に低磁場へ, 0=原画コントラスト）")
     args = ap.parse_args()
 
     simulate_lowfield(args.input, args.output, args.pattern,
@@ -333,7 +347,7 @@ def main() -> None:
                       args.target_snr, args.noise_sigma, args.ref_low,
                       args.blur_mm, args.in_plane_res, args.kspace_keep,
                       args.downsample, args.t1_strength, args.seed, args.desc,
-                      args.profile)
+                      args.profile, args.blur_scale, args.contrast_strength)
 
 
 if __name__ == "__main__":
