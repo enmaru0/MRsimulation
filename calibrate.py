@@ -282,6 +282,26 @@ def local_warp_test(sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
     return float(np.median(mags)), float(np.percentile(mags, 90))
 
 
+def resolution_test(sim: np.ndarray, real: np.ndarray, mask: np.ndarray):
+    """real と sim の高周波エネルギー比。>1 は real が高精細(=3D由来simがボケ)。"""
+    ys, xs = np.where(mask)
+    r0, r1, c0, c1 = ys.min(), ys.max(), xs.min(), xs.max()
+
+    def hf(img):
+        a = img[r0:r1 + 1, c0:c1 + 1].astype(float)
+        a = a - a.mean()
+        a = a * np.hanning(a.shape[0])[:, None] * np.hanning(a.shape[1])[None, :]
+        P = np.abs(np.fft.fftshift(np.fft.fft2(a))) ** 2
+        cy, cx = np.array(P.shape) // 2
+        Y, X = np.ogrid[:P.shape[0], :P.shape[1]]
+        rr = np.hypot(Y - cy, X - cx)
+        hi = rr > 0.5 * rr.max()
+        return P[hi].sum() / (P.sum() + 1e-12)
+
+    h_real, h_sim = hf(real), hf(sim)
+    return h_real, h_sim, h_real / (h_sim + 1e-12)
+
+
 def geometry_report(s3d: Series, s2d: Series) -> str:
     """FrameOfReference / 向き / 範囲の整合性を文字列で返す。"""
     lines = []
@@ -339,6 +359,7 @@ def qa_dump(qa_dir: str, sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
     # バイアス場（低周波の濃淡ムラ）と局所ワープ（幾何歪み）
     r_bias, bias_lo, bias_hi = bias_field_test(sim, real, mask)
     warp_med, warp_p90 = local_warp_test(sim, real, mask, ps)
+    hf_real, hf_sim, hf_ratio = resolution_test(sim, real, mask)
 
     report = [
         geom,
@@ -350,8 +371,12 @@ def qa_dump(qa_dir: str, sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
         f"r after bias-field    : {r_bias:.4f}  (bias 5-95%: "
         f"{bias_lo:.2f}-{bias_hi:.2f})",
         f"local warp |shift| mm : median={warp_med:.2f}  p90={warp_p90:.2f}",
+        f"high-freq energy real/sim : {hf_ratio:.2f}  "
+        f"(real={hf_real:.3f} sim={hf_sim:.3f})",
         "",
         "切り分け:",
+        "  hf_ratio ≫ 1 → real(2D)が高精細＝3D由来simがボケ。ブラーでは不可。",
+        "      3Dが本質的に低解像(例 3D TSE/VISTAのT2ブラー)。情報欠損で到達限界。",
         "  r_bias ≫ r_lin かつ bias幅が広い → コイル感度/正規化のバイアス場が主因",
         "  local warp p90 が大(>1-2mm) → 局所幾何歪み → 非剛体レジストレーション",
         "  どれでも上がらない → 真のコントラスト差(別シーケンス/脂肪抑制等)",
