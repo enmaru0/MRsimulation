@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""
+calibrate.py
+============
+同一患者・同一セッションで撮像した「実3D」と「実2D(正解)」のT2強調ペアから、
+2Dシミュレーションのパラメータを実測較正・検証する。
+
+目的
+----
+1. スライスプロファイル(SSP)推定 : 実2Dに最も一致する through-plane プロファイル
+   P(z) を台形(FWHM, ramp)で当てはめ、ssp.npy に保存して本体シミュレータに焼き込む。
+2. 精度の定量検証 : 較正後の擬似2D vs 実2D を NRMSE / Pearson r / SSIM で評価。
+
+前提
+----
+- 同一セッション・体動なし → DICOM患者座標(IPP/IOP)だけで画素対応が取れる
+  （レジストレーション不要）。各実2Dスライスの幾何で3Dを再標本化する。
+- magnitude / 別コントラストでも、強度の線形変換 a·x+b を同時推定して吸収する
+  （SSP推定が単純なスケール差で歪まないようにするため）。これは厳密なコントラスト
+  変換ではなく、SSPを公平に測るための正規化。
+
+forward model
+-------------
+    real2D(plane) ≈ a · Σ_t w(t; FWHM, ramp) · S3D(plane + t·n) + b
+    （+ Rician noise）
+
+各2Dスライス平面上で、法線 n 方向の密なオフセット t で3Dをトリリニア標本化した
+平面群 S3D(t) を「一度だけ」計算し、プロファイル重み w(t) は線形結合で与える。
+最適化は (FWHM, ramp) の2次元のみ非線形（a,b は各反復で閉形式）。
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+
+import numpy as np
+import pydicom
+from scipy.ndimage import map_coordinates, uniform_filter
+from scipy.optimize import minimize_scalar, minimize
+
+from mri_slice_sim import load_series, input_affine, Series
+
+
+# --------------------------------------------------------------------------- #
+# プロファイルモデル（台形）
+# --------------------------------------------------------------------------- #
+def trapezoid_weights(offsets: np.ndarray, fwhm: float, ramp: float) -> np.ndarray:
+    """中心0の台形プロファイルを offsets で評価し、総和1に正規化して返す。"""
+    half = fwhm / 2.0
+    a = np.abs(offsets)
+    w = np.ones_like(offsets, dtype=float)
+    if ramp > 1e-6:
+        edge = (a > half - ramp) & (a < half)
+        w[edge] = (half - a[edge]) / ramp
+    w[a >= half] = 0.0
+    s = w.sum()
+    return w / s if s > 0 else w
+
+
+# --------------------------------------------------------------------------- #
+# 3Dを各2Dスライス平面で標本化
+# --------------------------------------------------------------------------- #
+def plane_grid(ds2d: pydicom.Dataset):
+    """実2Dスライスの面内世界座標 base(R,C,3) と法線 n を返す。"""
+    iop = np.array(ds2d.ImageOrientationPatient, float)
+    u, v = iop[0:3], iop[3:6]
+    ipp = np.array(ds2d.ImagePositionPatient, float)
+    ps = [float(x) for x in ds2d.PixelSpacing]   # [row, col]
+    R, C = int(ds2d.Rows), int(ds2d.Columns)
+    cc = np.arange(C) * ps[1]
+    rr = np.arange(R) * ps[0]
+    base = (ipp[None, None, :]
+            + cc[None, :, None] * u[None, None, :]
+            + rr[:, None, None] * v[None, None, :])
+    n = np.cross(u, v)
+    n /= np.linalg.norm(n)
+    return base, n
+
+
+def sample_planes(vol3d: np.ndarray, Ainv3d: np.ndarray,
+                  base: np.ndarray, n: np.ndarray,
+                  offsets: np.ndarray) -> np.ndarray:
+    """3Dを base+t*n の各平面でトリリニア標本化。返り値 (len(offsets), R, C)。"""
+    R, C, _ = base.shape
+    out = np.empty((offsets.size, R, C), dtype=np.float32)
+    for i, t in enumerate(offsets):
+        world = base + t * n[None, None, :]
+        homog = np.concatenate([world, np.ones((R, C, 1))], axis=-1)
+        vox = homog @ Ainv3d.T                 # [col,row,slice]
+        coords = np.stack([vox[..., 2], vox[..., 1], vox[..., 0]], axis=0)
+        out[i] = map_coordinates(vol3d, coords, order=1, mode="constant", cval=0.0)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 較正本体
+# --------------------------------------------------------------------------- #
+def _fit_ab(x: np.ndarray, y: np.ndarray):
+    """y ≈ a*x + b の最小二乗解 (a, b)。"""
+    A = np.vstack([x, np.ones_like(x)]).T
+    (a, b), *_ = np.linalg.lstsq(A, y, rcond=None)
+    return a, b
+
+
+def fit_profile(Pmat: np.ndarray, y: np.ndarray, offsets: np.ndarray,
+                nominal: float):
+    """
+    Pmat: (T, N) 各オフセットの標本値（前景画素を連結）
+    y   : (N,)   対応する実2D画素値
+    戻り: dict(fwhm, ramp, a, b, sse)
+    """
+    def objective(params):
+        fwhm, ramp = params
+        w = trapezoid_weights(offsets, fwhm, ramp)
+        sim = w @ Pmat                          # (N,)
+        a, b = _fit_ab(sim, y)
+        resid = a * sim + b - y
+        return float(resid @ resid)
+
+    # 粗いグリッドから初期値 → 局所最適化
+    best = None
+    for fwhm0 in np.linspace(0.4 * nominal, 2.0 * nominal, 9):
+        for ramp0 in [0.0, 0.15 * nominal, 0.3 * nominal]:
+            val = objective([fwhm0, ramp0])
+            if best is None or val < best[0]:
+                best = (val, fwhm0, ramp0)
+    res = minimize(objective, x0=[best[1], best[2]], method="Nelder-Mead",
+                   options=dict(xatol=1e-3, fatol=1e-6, maxiter=500))
+    fwhm, ramp = res.x
+    ramp = max(0.0, min(ramp, fwhm / 2.0))
+    w = trapezoid_weights(offsets, fwhm, ramp)
+    sim = w @ Pmat
+    a, b = _fit_ab(sim, y)
+    return dict(fwhm=float(fwhm), ramp=float(ramp), a=float(a), b=float(b),
+                sse=float(res.fun))
+
+
+# --------------------------------------------------------------------------- #
+# 指標
+# --------------------------------------------------------------------------- #
+def nrmse(sim: np.ndarray, ref: np.ndarray, mask: np.ndarray) -> float:
+    d = sim[mask] - ref[mask]
+    rng = ref[mask].max() - ref[mask].min()
+    return float(np.sqrt(np.mean(d ** 2)) / (rng + 1e-9))
+
+
+def pearson(sim: np.ndarray, ref: np.ndarray, mask: np.ndarray) -> float:
+    x, y = sim[mask], ref[mask]
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def ssim(sim: np.ndarray, ref: np.ndarray, win: int = 7) -> float:
+    """ローカル窓SSIM(平均)。前処理なしの簡易版。"""
+    sim = sim.astype(np.float64); ref = ref.astype(np.float64)
+    L = ref.max() - ref.min() + 1e-9
+    c1, c2 = (0.01 * L) ** 2, (0.03 * L) ** 2
+    mu_x = uniform_filter(sim, win); mu_y = uniform_filter(ref, win)
+    sx = uniform_filter(sim * sim, win) - mu_x ** 2
+    sy = uniform_filter(ref * ref, win) - mu_y ** 2
+    sxy = uniform_filter(sim * ref, win) - mu_x * mu_y
+    num = (2 * mu_x * mu_y + c1) * (2 * sxy + c2)
+    den = (mu_x ** 2 + mu_y ** 2 + c1) * (sx + sy + c2)
+    return float(np.mean(num / den))
+
+
+# --------------------------------------------------------------------------- #
+def calibrate(dir3d: str, dir2d: str, pattern: str,
+              out_ssp: str, max_fit_slices: int, pixel_budget: int,
+              fg_percentile: float):
+    s3d = load_series(dir3d, pattern)
+    s2d = load_series(dir2d, pattern)
+    Ainv = np.linalg.inv(input_affine(s3d))
+    nominal = float(getattr(s2d.template, "SliceThickness", 5.0) or 5.0)
+    print(f"[load] 3D: {s3d.volume.shape}  2D: {len(s2d.datasets)} slices, "
+          f"nominal thickness={nominal}mm")
+
+    # オフセット格子（公称厚の±1.5倍を 0.25mm 刻み）
+    span = 1.5 * nominal
+    step = min(0.25, nominal / 20)
+    offsets = np.arange(-span, span + step / 2, step)
+
+    # fit用スライスを中央から選ぶ
+    n2d = len(s2d.datasets)
+    idx = np.linspace(0, n2d - 1, min(max_fit_slices, n2d)).round().astype(int)
+    idx = np.unique(idx)
+
+    cols, ys = [], []
+    rng = np.random.default_rng(0)
+    for k in idx:
+        ds = s2d.datasets[k]
+        real = ds.pixel_array.astype(np.float64)
+        slope = float(getattr(ds, "RescaleSlope", 1) or 1)
+        inter = float(getattr(ds, "RescaleIntercept", 0) or 0)
+        real = real * slope + inter
+        base, n = plane_grid(ds)
+        planes = sample_planes(s3d.volume, Ainv, base, n, offsets)  # (T,R,C)
+
+        thr = np.percentile(real, fg_percentile)
+        mask = real > thr
+        flat = mask.ravel()
+        fg = np.where(flat)[0]
+        if fg.size == 0:
+            continue
+        # 画素予算に合わせて間引き
+        per = max(1, pixel_budget // idx.size)
+        if fg.size > per:
+            fg = rng.choice(fg, per, replace=False)
+        Pmat = planes.reshape(offsets.size, -1)[:, fg]    # (T, n)
+        cols.append(Pmat)
+        ys.append(real.ravel()[fg])
+
+    Pmat = np.concatenate(cols, axis=1)
+    y = np.concatenate(ys)
+    print(f"[fit ] slices={idx.size} offsets={offsets.size} pixels={y.size}")
+
+    fit = fit_profile(Pmat, y, offsets, nominal)
+    # 矩形(公称厚)ベースラインとの比較
+    w_rect = trapezoid_weights(offsets, nominal, 0.0)
+    sim_r = w_rect @ Pmat; a_r, b_r = _fit_ab(sim_r, y)
+    sse_rect = float(np.sum((a_r * sim_r + b_r - y) ** 2))
+
+    print("\n=== Fitted slice profile (trapezoid) ===")
+    print(f"  FWHM         : {fit['fwhm']:.2f} mm   (nominal {nominal:.2f})")
+    print(f"  ramp(edge)   : {fit['ramp']:.2f} mm")
+    print(f"  intensity a,b: {fit['a']:.4f}, {fit['b']:.2f}")
+    print(f"  SSE  fitted  : {fit['sse']:.3e}")
+    print(f"  SSE  rect    : {sse_rect:.3e}   (improvement "
+          f"{100*(1-fit['sse']/sse_rect):.1f}%)")
+
+    # SSP保存（offset, weight）
+    w_fit = trapezoid_weights(offsets, fit['fwhm'], fit['ramp'])
+    np.save(out_ssp, np.vstack([offsets, w_fit]))
+    with open(os.path.splitext(out_ssp)[0] + ".json", "w") as f:
+        json.dump(fit, f, indent=2)
+    print(f"[save] SSP -> {out_ssp}  params -> {os.path.splitext(out_ssp)[0]}.json")
+
+    # fit画素での指標（散布点）
+    sim_fit = (w_fit @ Pmat) * fit['a'] + fit['b']
+    m = np.ones_like(y, bool)
+    print("\n=== Validation on fit pixels (fitted profile) ===")
+    print(f"  NRMSE : {nrmse(sim_fit, y, m):.4f}")
+    print(f"  r     : {pearson(sim_fit, y, m):.4f}")
+
+    # 代表スライス1枚を全画素で再構成して画像指標(SSIM含む)
+    kc = int(idx[len(idx) // 2])
+    ds = s2d.datasets[kc]
+    real = (ds.pixel_array.astype(np.float64)
+            * float(getattr(ds, "RescaleSlope", 1) or 1)
+            + float(getattr(ds, "RescaleIntercept", 0) or 0))
+    base, n = plane_grid(ds)
+    planes = sample_planes(s3d.volume, Ainv, base, n, offsets)
+    sim_img = np.tensordot(w_fit, planes, axes=(0, 0)) * fit['a'] + fit['b']
+    mask = real > np.percentile(real, fg_percentile)
+    print(f"\n=== Validation on full slice #{kc} (fitted profile) ===")
+    print(f"  NRMSE : {nrmse(sim_img, real, mask):.4f}")
+    print(f"  r     : {pearson(sim_img, real, mask):.4f}")
+    print(f"  SSIM  : {ssim(sim_img, real):.4f}")
+    return fit
+
+
+# --------------------------------------------------------------------------- #
+# 自己検証: 既知の台形SSPで合成した「2D」を、推定器が復元できるか
+# --------------------------------------------------------------------------- #
+def self_test(dir3d: str, pattern: str):
+    print("=== SELF TEST: recover a known trapezoid SSP ===")
+    s3d = load_series(dir3d, pattern)
+    Ainv = np.linalg.inv(input_affine(s3d))
+    # 3Dの軸位中央付近に仮想2Dスライス平面を数枚作る
+    K, R, C = s3d.volume.shape
+    A = input_affine(s3d)
+    u = np.array([1., 0, 0]); v = np.array([0, 1., 0]); n = np.array([0, 0, 1.])
+    nominal = 5.0
+    span = 1.5 * nominal; step = 0.25
+    offsets = np.arange(-span, span + step / 2, step)
+    true_fwhm, true_ramp, true_a, true_b = 5.0, 1.0, 1.3, 50.0
+    w_true = trapezoid_weights(offsets, true_fwhm, true_ramp)
+
+    ps_row = float(s3d.template.PixelSpacing[0])
+    ps_col = float(s3d.template.PixelSpacing[1])
+    cc = np.arange(C) * ps_col
+    rr = np.arange(R) * ps_row
+    cols, ys = [], []
+    rng = np.random.default_rng(1)
+    for kc in np.linspace(K * 0.3, K * 0.7, 5):
+        ipp = (A @ np.array([0, 0, kc, 1.0]))[:3]
+        base = (ipp[None, None, :]
+                + cc[None, :, None] * u[None, None, :]
+                + rr[:, None, None] * v[None, None, :])
+        planes = sample_planes(s3d.volume, Ainv, base, n, offsets)
+        synth = true_a * np.tensordot(w_true, planes, axes=(0, 0)) + true_b
+        synth += rng.normal(0, 5.0, synth.shape)   # ノイズ
+        real = synth
+        thr = np.percentile(real, 40)
+        fg = np.where((real > thr).ravel())[0]
+        fg = rng.choice(fg, min(8000, fg.size), replace=False)
+        cols.append(planes.reshape(offsets.size, -1)[:, fg])
+        ys.append(real.ravel()[fg])
+
+    Pmat = np.concatenate(cols, axis=1); y = np.concatenate(ys)
+    fit = fit_profile(Pmat, y, offsets, nominal)
+    print(f"  truth : FWHM={true_fwhm} ramp={true_ramp} a={true_a} b={true_b}")
+    print(f"  fitted: FWHM={fit['fwhm']:.2f} ramp={fit['ramp']:.2f} "
+          f"a={fit['a']:.3f} b={fit['b']:.1f}")
+    ok = abs(fit['fwhm'] - true_fwhm) < 0.5 and abs(fit['ramp'] - true_ramp) < 0.6
+    print("  RESULT:", "PASS" if ok else "FAIL")
+    return ok
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("dir3d", help="実3D DICOMフォルダ")
+    ap.add_argument("dir2d", nargs="?", help="実2D(正解) DICOMフォルダ")
+    ap.add_argument("--pattern", default="*", help="globパターン")
+    ap.add_argument("--out-ssp", default="ssp.npy", help="推定SSPの保存先")
+    ap.add_argument("--max-fit-slices", type=int, default=11, help="fitに使う2D枚数")
+    ap.add_argument("--pixel-budget", type=int, default=60000, help="fit総画素数の上限")
+    ap.add_argument("--fg-percentile", type=float, default=40.0,
+                    help="前景マスクのしきい値パーセンタイル")
+    ap.add_argument("--self-test", action="store_true",
+                    help="既知SSPの復元テスト(dir2d不要)")
+    args = ap.parse_args()
+
+    if args.self_test:
+        self_test(args.dir3d, args.pattern)
+        return
+    if not args.dir2d:
+        ap.error("dir2d が必要です（--self-test を除く）")
+    calibrate(args.dir3d, args.dir2d, args.pattern, args.out_ssp,
+              args.max_fit_slices, args.pixel_budget, args.fg_percentile)
+
+
+if __name__ == "__main__":
+    main()

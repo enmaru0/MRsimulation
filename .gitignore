@@ -17,3 +17,7 @@ out_*/
 
 # Claude Code local
 .claude/
+
+# Calibration / sim outputs
+*.npy
+ssp*.json

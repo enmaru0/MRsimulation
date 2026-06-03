@@ -80,6 +80,15 @@ PROFILES = {
 }
 
 
+def measured_profile(ssp_file: str):
+    """calibrate.py が保存した実測SSP(offset,weight)を補間する callable を返す。"""
+    arr = np.load(ssp_file)          # shape (2, M): [offsets; weights]
+    off, w = arr[0], arr[1]
+    span = float(off.max() - off.min())
+    f = lambda z: np.interp(z, off, w, left=0.0, right=0.0)
+    return f, span
+
+
 # --------------------------------------------------------------------------- #
 # シリーズ読み込みとジオメトリ
 # --------------------------------------------------------------------------- #
@@ -394,7 +403,8 @@ def simulate(in_dir: str,
              series_desc: str,
              orientation: str = "native",
              in_plane_spacing: float | None = None,
-             recon_step: float | None = None) -> None:
+             recon_step: float | None = None,
+             ssp_file: str | None = None) -> None:
     series = load_series(in_dir, pattern)
     dz_in = float(np.median(np.diff(series.positions)))
     ps_in = [float(x) for x in series.template.PixelSpacing]
@@ -402,10 +412,17 @@ def simulate(in_dir: str,
           f"{series.template.Rows}x{series.template.Columns}, "
           f"slice spacing ~{dz_in:.3f} mm, normal={np.round(series.normal,3)}")
 
-    profile = PROFILES[profile_name](thickness)
-    if support is None:
-        # 矩形は thickness、裾を持つプロファイルは余裕を見て広めに取る
-        support = thickness if profile_name == "rect" else thickness * 3.0
+    if ssp_file:
+        # calibrate.py の実測SSPを使用（thickness/profile指定より優先）
+        profile, span = measured_profile(ssp_file)
+        profile_name = f"measured({os.path.basename(ssp_file)})"
+        if support is None:
+            support = span
+    else:
+        profile = PROFILES[profile_name](thickness)
+        if support is None:
+            # 矩形は thickness、裾を持つプロファイルは余裕を見て広めに取る
+            support = thickness if profile_name == "rect" else thickness * 3.0
 
     if orientation == "native":
         # 入力スライス方向に沿って集約（リスライスなし）
@@ -457,11 +474,13 @@ def main() -> None:
                     help="リスライス時の面内画素間隔 [mm] (default: 入力の最小画素間隔)")
     ap.add_argument("--recon-step", type=float, default=None,
                     help="リスライス時の法線方向の細刻み [mm] (default: 入力の最小間隔)")
+    ap.add_argument("--ssp-file", default=None,
+                    help="calibrate.py が出力した実測SSP(.npy)。指定時は --profile/--thickness より優先")
     args = ap.parse_args()
 
     simulate(args.input, args.output, args.thickness, args.spacing,
              args.profile, args.support, args.start, args.pattern, args.desc,
-             args.orientation, args.in_plane_spacing, args.recon_step)
+             args.orientation, args.in_plane_spacing, args.recon_step, args.ssp_file)
 
 
 if __name__ == "__main__":

@@ -162,6 +162,71 @@ python3 -m venv .venv
 
 ---
 
+## 実ペアデータによる較正・検証 (`calibrate.py`)
+
+同一患者・同一セッションで撮像した **実3D と 実2D(正解)** のペアがあれば、
+スライスプロファイルを「仮定」ではなく **実測** し、シミュレーション精度を定量検証できる。
+
+```
+実3D ──[シミュレーション]──> 擬似2D
+                                  │ 比較・最適化
+実2D(正解) ──────────────────────┘
+```
+
+### 前提
+- **同一セッション・体動なし** を想定。DICOM患者座標(IPP/IOP)だけで画素対応が取れるため
+  レジストレーション不要。各実2Dスライスの幾何で3Dを再標本化する。
+- magnitude / 別コントラスト(2D TSE と 3D SPACE 等)でも、強度の線形変換 `a·x+b` を
+  同時推定して吸収する（SSP推定を単純なスケール差で歪ませないための正規化）。
+
+### フォワードモデル
+
+```
+real2D(plane) ≈ a · Σ_t w(t; FWHM, ramp) · S3D(plane + t·n) + b
+```
+
+各2Dスライス平面で法線方向 `n` の密なオフセット `t` で3Dを一度だけトリリニア標本化し、
+プロファイル `w` は **台形(FWHM, ramp)** で当てはめる。非線形最適化は (FWHM, ramp) の
+2次元のみで、`a,b` は各反復で閉形式に解く。
+
+### 使い方
+
+```bash
+# 1) SSPを推定（実測較正） → ssp.npy / ssp.json を出力
+.venv/bin/python calibrate.py <実3D dir> <実2D dir> --pattern "*.dcm" --out-ssp ssp.npy
+
+# 2) 推定SSPを焼き込んで擬似2Dを生成
+.venv/bin/python mri_slice_sim.py <実3D dir> out_calib \
+    --spacing 6 --thickness 5 --ssp-file ssp.npy --pattern "*.dcm"
+```
+
+`calibrate.py` の出力（推定FWHM/ramp、強度a,b、矩形ベースラインに対するSSE改善率、
+fit画素でのNRMSE/Pearson r）で精度を確認できる。
+
+### 推定器の自己検証
+
+実データが無くても、既知の台形SSPで合成した「2D」を推定器が復元できるか検証できる:
+
+```bash
+.venv/bin/python calibrate.py <任意の3D dir> --pattern "*.dcm" --self-test
+# truth: FWHM=5.0 ramp=1.0 a=1.3 b=50.0 / fitted: FWHM≈4.8 ramp≈0.8 ... PASS
+```
+
+### `calibrate.py` の主なオプション
+
+| オプション | 既定 | 説明 |
+|---|---|---|
+| `--out-ssp` | `ssp.npy` | 推定SSPの保存先（`(offset, weight)` 配列） |
+| `--max-fit-slices` | `11` | fitに使う2D枚数（中央から等間隔抽出） |
+| `--pixel-budget` | `60000` | fitに使う総画素数の上限 |
+| `--fg-percentile` | `40` | 前景マスクのしきい値パーセンタイル |
+| `--self-test` | — | 既知SSPの復元テスト（`dir2d` 不要） |
+
+> 注: `--ssp-file` 使用時は `--thickness` も指定すると、出力DICOMの `SliceThickness`
+> タグが公称厚に一致する（SSP自体は実測形状を使う）。
+
+---
+
 ## 今後の拡張余地
 
 | 目的 | 追加処理 |
