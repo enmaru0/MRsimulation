@@ -103,13 +103,26 @@ def signal_level(vol: np.ndarray, fg_percentile: float = 60.0) -> float:
     return float(np.median(fg)) if fg.size else float(vol.max())
 
 
-def add_rician(img: np.ndarray, sigma: float, rng: np.random.Generator) -> np.ndarray:
-    """magnitude img に σ の複素ガウシアンを加え Rician magnitude を返す。"""
+def add_rician(img: np.ndarray, sigma: float, rng: np.random.Generator,
+               corr_fwhm_px: float = 0.0) -> np.ndarray:
+    """magnitude img に σ の複素ガウシアンを加え Rician magnitude を返す。
+
+    corr_fwhm_px>0 で、ノイズを空間相関させる（取得解像度スケールの粗いノイズ）。
+    ゼロフィル補間/低マトリクス取得の実低磁場は白色でなく粗い相関ノイズになるため、
+    分散は σ を保ったまま相関長だけ与える（白色だと細かすぎて見た目が合わない）。
+    """
     if sigma <= 0:
         return img
     m = np.clip(img, 0, None)
-    n1 = rng.normal(0.0, sigma, m.shape)
-    n2 = rng.normal(0.0, sigma, m.shape)
+    if corr_fwhm_px > 0.5:
+        sg = corr_fwhm_px / 2.3548
+        n1 = gaussian_filter(rng.normal(0.0, 1.0, m.shape), sg)
+        n2 = gaussian_filter(rng.normal(0.0, 1.0, m.shape), sg)
+        n1 *= sigma / (n1.std() + 1e-9)         # 平滑化で減った分散を σ に戻す
+        n2 *= sigma / (n2.std() + 1e-9)
+    else:
+        n1 = rng.normal(0.0, sigma, m.shape)
+        n2 = rng.normal(0.0, sigma, m.shape)
     return np.sqrt((m + n1) ** 2 + n2 ** 2)
 
 
@@ -231,6 +244,7 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
     s = load_series(in_dir, pattern)
     vol = s.volume.copy()
     ps = [float(x) for x in s.template.PixelSpacing]
+    noise_corr_px = 0.0          # ノイズの空間相関長[出力画素]（0=白色）
 
     # 実低磁場プロファイル（lowfield_calibrate.py 出力）を適用
     if profile is not None:
@@ -250,7 +264,15 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         # 解像度: 取得解像度どうしで比較（高磁場もゼロフィルなら再構成PixelSpacingは過小）
         res_low = float(prof["resolution_mm"])
         _, res_high = inplane_resolution_mm(s.template)
-        base_blur = res_to_blur_sigma(res_low, res_high) * float(blur_scale)
+        # ノイズ相関長 = 低磁場取得解像度を出力画素で表したもの
+        #   （ゼロフィル/低マトリクスの実低磁場ノイズは白色でなくこの長さで粗く相関）
+        noise_corr_px = res_low / min(ps)
+        if downsample < 1.0:
+            # --downsample が解像度低下と相関ノイズを担うので二重適用しない
+            base_blur = 0.0
+            noise_corr_px = 0.0
+        else:
+            base_blur = res_to_blur_sigma(res_low, res_high) * float(blur_scale)
         blur_mm = max(blur_mm, base_blur)               # --blur-mm でさらに上乗せ可
         # ノイズ: ユーザーが --target-snr/--noise-sigma を明示しなければ profile を使う
         if target_snr is None and noise_sigma is None:
@@ -259,7 +281,7 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         print(f"[prof] {profile} name={prof.get('name','?')} "
               f"target_snr={target_snr} contrast={cs:.2f} "
               f"res_low={res_low:.2f}mm res_high={res_high:.2f}mm "
-              f"blur_scale={blur_scale} -> blur={blur_mm:.2f}mm")
+              f"blur={blur_mm:.2f}mm noise_corr={noise_corr_px:.1f}px")
 
     sigma_high, _, _, _ = estimate_noise_sigma(vol)
     sig = signal_level(vol)
@@ -315,7 +337,7 @@ def simulate_lowfield(in_dir: str, out_dir: str, pattern: str,
         if downsample < 1.0:
             img = resolution_downup(img, downsample, rng, sigma_add)
         else:
-            img = add_rician(img, sigma_add, rng)
+            img = add_rician(img, sigma_add, rng, noise_corr_px)
 
         px = _encode_px(ds, img, slope, intercept)
         ds = pydicom.dcmread(ds.filename)
