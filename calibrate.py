@@ -246,6 +246,42 @@ def estimate_shift(ref: np.ndarray, mov: np.ndarray):
     return peak  # (drow, dcol)
 
 
+def _smooth_masked(img: np.ndarray, mask: np.ndarray, sigma: float) -> np.ndarray:
+    """マスク内のみで正規化したガウシアン平滑化（normalized convolution）。"""
+    a = gaussian_filter(np.where(mask, img, 0.0), sigma)
+    w = gaussian_filter(mask.astype(float), sigma)
+    return a / (w + 1e-6)
+
+
+def bias_field_test(sim: np.ndarray, real: np.ndarray, mask: np.ndarray):
+    """滑らかな乗法バイアス場を補正したときの相関と、場の変動幅を返す。"""
+    sigma = max(sim.shape) / 8.0
+    bias = _smooth_masked(real, mask, sigma) / (_smooth_masked(sim, mask, sigma) + 1e-6)
+    corrected = sim * bias
+    r_bias = float(np.corrcoef(corrected[mask], real[mask])[0, 1])
+    lo, hi = np.percentile(bias[mask], [5, 95])
+    return r_bias, float(lo), float(hi)
+
+
+def local_warp_test(sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
+                    ps: list, grid: int = 6):
+    """画像をgrid×gridに分割し各パッチの位相相関シフトを測る→局所歪みの指標。"""
+    R, C = real.shape
+    hs, ws = R // grid, C // grid
+    mags = []
+    for i in range(grid):
+        for j in range(grid):
+            rs, cs = slice(i * hs, (i + 1) * hs), slice(j * ws, (j + 1) * ws)
+            if mask[rs, cs].mean() < 0.5:
+                continue
+            drow, dcol = estimate_shift(real[rs, cs], sim[rs, cs])
+            mags.append(np.hypot(drow * ps[0], dcol * ps[1]))
+    if not mags:
+        return 0.0, 0.0
+    mags = np.array(mags)
+    return float(np.median(mags)), float(np.percentile(mags, 90))
+
+
 def geometry_report(s3d: Series, s2d: Series) -> str:
     """FrameOfReference / 向き / 範囲の整合性を文字列で返す。"""
     lines = []
@@ -300,17 +336,26 @@ def qa_dump(qa_dir: str, sim: np.ndarray, real: np.ndarray, mask: np.ndarray,
     x, y = sim[mask], real[mask]
     r_lin = float(np.corrcoef(x, y)[0, 1])
     r_mono = float(spearmanr(x, y).statistic)
+    # バイアス場（低周波の濃淡ムラ）と局所ワープ（幾何歪み）
+    r_bias, bias_lo, bias_hi = bias_field_test(sim, real, mask)
+    warp_med, warp_p90 = local_warp_test(sim, real, mask, ps)
 
     report = [
         geom,
         "",
-        f"residual in-plane shift : drow={drow:.1f}px dcol={dcol:.1f}px "
+        f"residual global shift : drow={drow:.1f}px dcol={dcol:.1f}px "
         f"=> ({shift_mm[0]:.2f}, {shift_mm[1]:.2f}) mm",
-        "   |shift|>1px は位置ずれ/レジストレーション不足を示唆",
-        f"Pearson r (linear)   : {r_lin:.4f}",
-        f"Spearman r (monotone): {r_mono:.4f}",
-        "   r_mono >> r_lin なら単調な非線形コントラスト差 → 強度マップの高度化で改善",
-        "   両方低いなら 位置ずれ / 面内解像度差(PSF/Gibbs) が主因",
+        f"Pearson r (linear)    : {r_lin:.4f}",
+        f"Spearman r (monotone) : {r_mono:.4f}",
+        f"r after bias-field    : {r_bias:.4f}  (bias 5-95%: "
+        f"{bias_lo:.2f}-{bias_hi:.2f})",
+        f"local warp |shift| mm : median={warp_med:.2f}  p90={warp_p90:.2f}",
+        "",
+        "切り分け:",
+        "  r_bias ≫ r_lin かつ bias幅が広い → コイル感度/正規化のバイアス場が主因",
+        "  local warp p90 が大(>1-2mm) → 局所幾何歪み → 非剛体レジストレーション",
+        "  どれでも上がらない → 真のコントラスト差(別シーケンス/脂肪抑制等)",
+        "  r_mono ≫ r_lin → 単調非線形コントラスト → 強度マップ高度化",
     ]
     txt = "\n".join(report)
     with open(os.path.join(qa_dir, "diagnostics.txt"), "w") as f:

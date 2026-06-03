@@ -268,9 +268,11 @@ real2D ≈ a · [ Gauss_inplane(σ) ∘ Σ_t w(t)·S3D(plane + t·n) ] + b
 | 兆候 | 解釈 | 対処 |
 |---|---|---|
 | `FrameOfReferenceUID 3D==2D : False` | 別座標系。IPP/IOPの直接対応が無効 | 剛体レジストレーションが必須 |
-| 残差シフト `|shift|>1px` | 位置ずれ/体動 | レジストレーションで補正 |
+| 残差(全体)シフト `|shift|>1px` | 位置ずれ/体動 | レジストレーションで補正 |
+| `r after bias-field` ≫ Pearson かつ bias幅が広い | コイル感度/正規化のバイアス場 | 滑らかな乗法バイアス場で補正 |
+| `local warp p90` が大（>1–2mm） | 局所幾何歪み(B0/帯域差) | 非剛体(deformable)レジストレーション |
 | Spearman ≫ Pearson | 単調な非線形コントラスト差 | 強度マップを線形→単調へ高度化 |
-| 両方低い | 位置ずれ or 面内解像度差(PSF/Gibbs) | レジストレーション／面内PSF較正 |
+| どれでも上がらない（Spearmanも低い） | 真のコントラスト差(別シーケンス/脂肪抑制等) | 厚み較正の限界。組織別モデル等が必要 |
 
 > `compare.png` の出力には matplotlib が必要（`pip install matplotlib`）。無い場合は
 > `.npy` 配列と診断テキストのみ保存される。
