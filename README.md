@@ -1,6 +1,10 @@
 # MRsimulation
 
-3DのMRI(または任意)DICOMシリーズから、擬似的な **2D厚スライスDICOM** を合成するシミュレーションツール。
+MRI DICOM から物理的に整合したシミュレーション画像を合成するツール群。
+
+- **`mri_slice_sim.py`** — 3D薄スライス → 2D厚スライス（スライスプロファイル積分）
+- **`calibrate.py`** — 実2D/3Dペアからスライスプロファイル等を実測較正・診断
+- **`lowfield_sim.py`** — 高磁場(1.5T/3T) → 低磁場(0.3-0.5T)風の劣化（ノイズ/解像度）
 
 例: 1mmスライス厚の3Dデータ → **5mm厚 / 6mm間隔**の2D画像を、MRIの原理に基づいて生成する。
 
@@ -300,6 +304,76 @@ real2D ≈ a · [ Gauss_inplane(σ) ∘ Σ_t w(t)·S3D(plane + t·n) ] + b
 
 > 注: `--ssp-file` 使用時は `--thickness` も指定すると、出力DICOMの `SliceThickness`
 > タグが公称厚に一致する（SSP自体は実測形状を使う）。
+
+---
+
+## 高磁場→低磁場シミュレーション (`lowfield_sim.py`)
+
+1.5T/3Tの高画質MRIから、物理的に整合した **低磁場(0.3-0.5T)風の劣化画像** を合成する。
+教師あり学習の **(入力=低磁場風 / 正解=高磁場)** ペア生成用。各スライスを独立処理し、
+ジオメトリ（IPP/IOP/PixelSpacing）はそのまま保持する。
+
+### モデル化する劣化
+
+| 劣化 | 物理 | モデル |
+|---|---|---|
+| **SNR低下(主役)** | SNR ∝ B0^p (既定 p=1)。3T→0.5Tで約6倍ノイズ | **Rician**（複素ガウシアン→magnitude）。低SNRでノイズフロア/信号バイアスを再現 |
+| **解像度低下/ボケ** | 大ボクセル・低マトリクス・再構成フィルタ | 面内ガウシアンPSF / k空間トランケーション(Gibbs) / ダウンサンプル |
+| **T1短縮(任意・近似)** | T1 ∝ B0^α で低磁場ほど短縮 | 経験的コントラスト圧縮（既定OFF。厳密には定量マップが必要） |
+
+### ノイズ量の決め方（「実画像と同等」にする鍵）
+
+既存ノイズ `σ_high` を **画像コーナー(空気)の Rayleigh 統計** から実測し、磁場比でスケール:
+
+```
+σ_low = σ_high · (B0_high / B0_low)^p ,   σ_add = sqrt(σ_low² − σ_high²)
+```
+
+実際の低磁場画像があれば `--ref-low` でその背景から `σ_low` を直接実測して合わせられる
+（最も実機に近い）。`--target-snr` / `--noise-sigma` で直接指定も可能。
+
+### 使い方
+
+```bash
+# 3T -> 0.5T: 磁場比でノイズ、面内0.8mmボケ、k空間70%(Gibbs)
+.venv/bin/python lowfield_sim.py highfield_dir lowfield_out --pattern "*.dcm" \
+    --field-high 3.0 --field-low 0.5 --blur-mm 0.8 --kspace-keep 0.7
+
+# 実低磁場画像の背景ノイズに合わせる
+.venv/bin/python lowfield_sim.py highfield_dir lowfield_out \
+    --ref-low real_lowfield_dir --in-plane-res 1.2
+
+# 学習用に複数のノイズレベル/シードでデータ拡張
+for s in 0 1 2; do
+  .venv/bin/python lowfield_sim.py highfield_dir out_seed$s --seed $s --field-low 0.4
+done
+```
+
+### 主なオプション
+
+| オプション | 既定 | 説明 |
+|---|---|---|
+| `--field-high` / `--field-low` | `3.0` / `0.5` | SNRスケール用の磁場強度[T] |
+| `--snr-exponent` | `1.0` | SNR ∝ B0^p の p（体雑音支配で≈1、コイル雑音支配で最大≈1.75） |
+| `--target-snr` | — | 目標SNRを直接指定（σ_high推定を使わない） |
+| `--noise-sigma` | — | 追加前の目標σを実値で直接指定 |
+| `--ref-low` | — | 実低磁場シリーズの背景からσを実測して合わせる |
+| `--blur-mm` | `0` | 面内ガウシアンPSF σ[mm] |
+| `--in-plane-res` | — | 目標面内解像度[mm]（等価ボケに換算） |
+| `--kspace-keep` | `1.0` | k空間中央の保持割合(0-1]。<1でGibbs/解像度低下 |
+| `--downsample` | `1.0` | 取得解像度の縮小率(0-1]。<1で縮小→ノイズ→拡大 |
+| `--t1-strength` | `0` | 低磁場T1短縮の近似強度[0-1]（近似なので注意） |
+| `--seed` | `0` | 乱数シード（データ拡張用） |
+
+### 注意・限界
+
+- **単一コイル magnitude を仮定**（Rician）。パラレルイメージング/多コイルは
+  noncentral-chi + 空間変動 g-factor になるため本ツールは近似。
+- **T1コントラスト変化は粗い近似**。T2強調など磁場ロバストなコントラストでは省略可。
+  厳密化には定量マップ(T1/T2)＋信号方程式が必要。
+- 低磁場の **厚いスライス** も同時に作る場合は `mri_slice_sim.py` と組み合わせる。
+- 磁場比パスは入力に測定可能な背景ノイズがある前提。ほぼ無ノイズの入力では
+  `--target-snr` / `--noise-sigma` を使う。
 
 ---
 
