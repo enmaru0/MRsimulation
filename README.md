@@ -448,6 +448,30 @@ python lowfield_calibrate.py real_low_T1 --name T1 --high high_T1 --out prof_T1.
 `--blur-mm` は実低磁場の見た目に合わせる微調整に使う。`--profile` 適用時は profile の
 `resolution_mm`（取得解像度）から `--blur-mm` 相当が自動で入る。
 
+### 手動ノイズ計測 (`measure_noise.py`)
+
+自動推定が当てにならない時、ビューアで読み取ったROI座標 `x,y,w,h`（x=列,y=行）で
+ノイズσ・SNRを手動計測できる。結果は `lowfield_sim --target-snr` にそのまま渡せる。
+
+```bash
+# 信号ROI + 背景ROI から SNR を測る（推奨: 実低磁場で測って高磁場へ適用）
+python measure_noise.py MRP/hitachi025/T2AX --slice 10 \
+    --signal-roi 220,210,30,30 --noise-roi 10,10,40,40
+#   => SNR = signal/σ = ...   --target-snr <値> をそのまま使う
+
+# 均一組織ROIだけで σ を測る（平坦部を選ぶ）
+python measure_noise.py MRP/hitachi025/T2AX --noise-roi 200,200,20,20 --noise-region tissue
+
+# ROI未指定なら自動推定(corner/laplacian)を表示
+python measure_noise.py MRP/hitachi025/T2AX
+```
+
+- 背景(空気)ROI: Rayleigh統計で `σ = √(mean(M²)/2)`（単純std は Rayleigh で 0.655σ と過小になる）。
+- 組織ROI: そのstdを直接ノイズとする（構造のない平坦部を選ぶこと）。
+- `--slice all` で複数スライスをまとめて計測でき安定する。
+- **`--target-snr`（SNR）はスケール不変**なので、実低磁場で測った値を高磁場へ適用するのに最適。
+  `--noise-sigma`（σ実値）は同一スケールの時のみ。
+
 ### 注意・限界
 
 - **コントラスト変換は周辺分布のヒストグラムマッチング**（unpairedで可能な範囲）。
