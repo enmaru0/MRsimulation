@@ -207,6 +207,38 @@ def ifftc_axis(x: np.ndarray, axis: int) -> np.ndarray:
         np.fft.ifft(np.fft.ifftshift(x, axes=axis), axis=axis, norm="ortho"), axes=axis)
 
 
+def detect_layout(shape, enc_x, enc_y, enc_z):
+    """4D k空間の軸配置を、ヘッダの encodedSpace(x,y,z) と各軸サイズの一致で推定し、
+    標準順 (kz, coil, ky, kx) への並べ替え permutation を返す。判定不能なら None。
+
+    kx=enc.x(readout), ky=enc.y(phase), kz=enc.z(partition), 残り=coil。
+    in-plane(ky,kx)が最後の2軸でない/パーティションが軸0でない場合の自動補正に使う。
+    """
+    if len(shape) != 4:
+        return None
+    ex = int(enc_x) if enc_x else None
+    ey = int(enc_y) if enc_y else None
+    ez = int(enc_z) if enc_z else None
+    if not ex or not ey or not ez or ez <= 1:
+        return None
+    axes, used = list(range(4)), []
+
+    def match(target):
+        for a in axes:
+            if a not in used and abs(shape[a] - target) <= 1:
+                used.append(a)
+                return a
+        return None
+
+    kx = match(ex)
+    ky = match(ey)
+    kz = match(ez)
+    rest = [a for a in axes if a not in used]
+    if kx is None or ky is None or kz is None or len(rest) != 1:
+        return None
+    return (kz, rest[0], ky, kx)         # → (kz, coil, ky, kx)
+
+
 def reconstruct(kspace: np.ndarray, recon_size=None, acq_matrix=None,
                 snr: float | None = None, rng=None,
                 partition_3d: bool = False, recon_z=None,
@@ -288,7 +320,8 @@ def parse_header(raw) -> dict:
         "protocol": None, "sequence": None,
         "series_uid": None, "study_uid": None, "for_uid": None,
         "study_time": None,
-        "enc_z": None, "recon_z": None, "is_3d": False,
+        "enc_x": None, "enc_y": None, "enc_z": None,
+        "recon_z": None, "is_3d": False,
     }
     if raw is None:
         return meta
@@ -323,8 +356,11 @@ def parse_header(raw) -> dict:
     enc_sp = _find(enc, "encodedSpace")
     enc_mat = _find(enc_sp, "matrixSize")
     rec_mat = mat
+    ex, ey = (_ftext(enc_mat, "x"), _ftext(enc_mat, "y")) if enc_mat is not None else (None, None)
     ez = _ftext(enc_mat, "z") if enc_mat is not None else None
     rz = _ftext(rec_mat, "z") if rec_mat is not None else None
+    meta["enc_x"] = int(ex) if ex else None
+    meta["enc_y"] = int(ey) if ey else None
     meta["enc_z"] = int(ez) if ez else None
     meta["recon_z"] = int(rz) if rz else None
     # kspace_encoding_step_2（パーティション位相エンコード）の最大値も併用
@@ -557,7 +593,8 @@ def save_binary(vol: np.ndarray, rescale_slope: float, data_max: float, meta: di
 def process_file(path: str, in_root: str, out_root: str, fmts: set,
                  acq_matrix=None, snr=None, rng=None,
                  flip_x="auto", flip_y="auto", reverse="auto",
-                 slab=1, slab_step=None, recon_3d="auto", part_axis=0) -> int:
+                 slab=1, slab_step=None, recon_3d="auto", part_axis=0,
+                 transpose=None) -> int:
     rel = os.path.relpath(path, in_root)
     base = os.path.splitext(rel)[0]            # 例 inter-scan_motion/2022061401_T101
 
@@ -574,6 +611,18 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
 
     # 3D取得か（auto=ヘッダの encodedSpace.z / kspace_encoding_step_2 から判定）
     is3d = meta["is_3d"] if recon_3d == "auto" else (recon_3d == "on")
+
+    # k空間の軸配置補正: --transpose 明示 > 3D時の自動推定（ヘッダのマトリクスサイズ一致）
+    layout_note = ""
+    if transpose is not None:
+        ks = np.ascontiguousarray(np.transpose(ks, transpose))
+        layout_note = f"transpose={transpose}"
+    elif is3d:
+        perm = detect_layout(ks.shape, meta.get("enc_x"), meta.get("enc_y"),
+                             meta.get("enc_z"))
+        if perm and perm != tuple(range(ks.ndim)):
+            ks = np.ascontiguousarray(np.transpose(ks, perm))
+            layout_note = f"auto-layout {tuple(ks.shape)} (perm={perm})"
 
     rss = reconstruct(ks, recon_size=recon_size, acq_matrix=acq_matrix,
                       snr=snr, rng=rng, partition_3d=is3d,
@@ -625,7 +674,8 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
     print(f"[ok] {rel}  ({acq}, {meta.get('patient_position') or '?'}"
           f"{', 3D' if is3d else ''})  "
           f"{rss.shape[0]} slices {rss.shape[1]}x{rss.shape[2]}  "
-          f"[{'+'.join(sorted(fmts))}]{lf}{lf_slab}  rev_slices={rev}")
+          f"[{'+'.join(sorted(fmts))}]{lf}{lf_slab}  rev_slices={rev}"
+          f"{('  ' + layout_note) if layout_note else ''}")
 
     nz, ny, nx = rss.shape
     return {
@@ -701,6 +751,9 @@ def main() -> None:
                          "on=強制3D(スライス方向もIFFT)、off=面内のみ(2Dマルチスライス)")
     ap.add_argument("--part-axis", type=int, default=0,
                     help="3D時のパーティション(kz)軸（既定0。kspace=(kz,coil,ky,kx)前提）")
+    ap.add_argument("--transpose", default=None,
+                    help="k空間の軸を明示的に並べ替える permutation（例 '2,0,3,1'）。"
+                         "標準順 (kz/slice, coil, ky, kx) へ。inspect_h5.py で軸を確認")
     args = ap.parse_args()
 
     fmt_map = {
@@ -714,6 +767,7 @@ def main() -> None:
         parts = [int(v) for v in str(args.acq_matrix).replace("x", ",").split(",")]
         acq_matrix = (parts[0], parts[0]) if len(parts) == 1 else (parts[0], parts[1])
     rng = np.random.default_rng(args.seed) if args.lowfield_snr else None
+    transpose = tuple(int(v) for v in args.transpose.split(",")) if args.transpose else None
 
     files = sorted(glob.glob(os.path.join(args.in_root, "**", "*.h5"), recursive=True))
     if args.limit:
@@ -734,7 +788,8 @@ def main() -> None:
                                flip_x=args.flip_x, flip_y=args.flip_y,
                                reverse=args.reverse_slices,
                                slab=args.slab, slab_step=args.slab_step,
-                               recon_3d=args.recon_3d, part_axis=args.part_axis)
+                               recon_3d=args.recon_3d, part_axis=args.part_axis,
+                               transpose=transpose)
             records.append(rec)
             n_slices += rec["n_slices"]
             n_files += 1

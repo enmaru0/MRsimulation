@@ -52,11 +52,23 @@ mag  = sqrt( Σ_c |imgs_c|² )                        # コイル RSS
 mag  = crop(mag, reconSpace.z)                      # パーティションのオーバーサンプル除去
 ```
 
-- 既定の k空間レイアウトは **`(kz, coils, ky, kx)`**（軸0=パーティション）。異なる場合は
-  `--part-axis` で指定。
-- `--recon-3d on`/`off` で強制/無効化できる（auto が誤判定する形式向け）。
-- 合成3Dファントムのラウンドトリップで検証済み（相対誤差 ~1e-7）。2D 取得は自動で
-  従来どおり面内のみ IFFT（回帰確認済み）。
+- 既定の k空間レイアウトは **`(kz, coils, ky, kx)`**（軸0=パーティション、最後の2軸=面内）。
+- **軸配置の自動判定**: 3D時は `encodedSpace` の (x,y,z) と各軸サイズを突き合わせて、
+  `kx=enc.x` `ky=enc.y` `kz=enc.z` 残り=coil を推定し、標準順へ自動で並べ替える。
+- 自動判定が外れる/出力形状がおかしい時（例 `256 slices 170x24`）は、まず **`inspect_h5.py`**
+  で各軸の役割を確認し、**`--transpose`** で軸順を明示する。
+
+```bash
+# 1) 軸配置を確認（各 kspace 軸が kx/ky/kz/coil のどれか）
+python inspect_h5.py <3D_h5_dir>
+
+# 2) 例: 実データが (ky, kx, kz, coil) なら 標準(kz,coil,ky,kx) へ並べ替え
+python recon_motion.py --in-root <dir> --out-root out --transpose 2,3,0,1
+```
+
+- `--recon-3d on`/`off` で強制/無効化、`--part-axis` でパーティション軸を指定。
+- 合成3Dファントムのラウンドトリップで検証済み（標準/非標準レイアウトとも相対誤差 ~1e-7）。
+  2D 取得は自動で従来どおり面内のみ IFFT（回帰確認済み）。
 
 > このリポジトリの既存データ（brain/gre/knee）はすべて 2D マルチスライス取得。3D データは
 > このPCには無いが、上記の自動判定＋3D IFFT で再構成できるよう実装・検証してある。
