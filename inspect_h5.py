@@ -61,7 +61,8 @@ def inspect(path: str) -> None:
         print("keys:", list(h.keys()))
         ks = h["kspace"]
         shape = ks.shape
-        print(f"kspace: shape={shape}  ndim={ks.ndim}  dtype={ks.dtype}")
+        ks_dtype = ks.dtype
+        print(f"kspace: shape={shape}  ndim={ks.ndim}  dtype={ks_dtype}")
         for k, v in h.attrs.items():
             print(f"  attr {k} = {v}")
         hdr = _hdr_text(h)
@@ -97,13 +98,33 @@ def inspect(path: str) -> None:
         tag = "  ".join(hits) if hits else "（一致なし → おそらく coil か oversampled readout）"
         print(f"  axis {ax}: size={n:>5}  -> {tag}")
 
+    # --- 実数格納（実/虚インターリーブ）の検出 ---
+    is_complex = np.issubdtype(np.dtype(ks_dtype), np.complexfloating)
+    real_stored = not is_complex
+    if real_stored:
+        print("注意: dtype が実数 → 複素が **実/虚インターリーブ** で格納されている可能性大。")
+        print(f"      最後の軸 size={shape[-1]} が偶数なら 2×コイル（実/虚ペア）。"
+              f" → recon_motion に --real-imag-axis -1 を付けて複素化する。")
+
     # --- 推奨レイアウト ---
     print("推奨:")
-    print("  recon_motion は標準レイアウト (kz, coil, ky, kx) = 軸(0,1,2,3) を想定。")
-    print("  上の推定で kx/ky が最後の2軸、partition(kz) が軸0 になっていない場合は、")
-    print("  実データをその順へ並べ替える必要がある（--part-axis でパーティション軸を指定可能。")
-    print("  面内 ky,kx が最後の2軸でない場合は要相談：軸順を教えてください）。")
-    print("  ※ coil 軸は通常ヘッダ matrix と一致しない軸（受信チャネル数）。")
+    no_header = (enc.get("mx") is None)
+    cc_like = (real_stored and len(shape) == 4 and shape[-1] % 2 == 0 and no_header)
+    if cc_like:
+        ncoil = shape[-1] // 2
+        print("  → Calgary-Campinas 形式の可能性大（ヘッダ無し・実数・最後の軸=2×コイル）。")
+        print(f"     軸構成の想定: (スライス={shape[0]}, ky={shape[1]}, kx={shape[2]}, "
+              f"coil×2={shape[-1]}→{ncoil}coil)。第1軸は既に画像領域（CCチャレンジ規約）。")
+        print("     コマンド例:")
+        print("       python recon_motion.py --in-root <dir> --out-root cc_out \\")
+        print("           --real-imag-axis -1 --transpose 0,3,1,2 --format png")
+        print("       # 複素化(24->12coil) → (slice,coil,ky,kx) へ並べ替え → 2D再構成")
+        print("     ※ スライス方向(第1軸)がもしk空間なら --recon-3d on を追加して比較。")
+    else:
+        print("  recon_motion は標準レイアウト (kz, coil, ky, kx) = 軸(0,1,2,3) を想定。")
+        print("  上の推定で kx/ky が最後の2軸、partition(kz) が軸0 になっていない場合は、")
+        print("  --transpose で並べ替える（面内 ky,kx を最後の2軸、coil を軸1 へ）。")
+        print("  ※ coil 軸は通常ヘッダ matrix と一致しない軸（受信チャネル数）。")
 
 
 def main() -> None:

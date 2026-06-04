@@ -207,6 +207,21 @@ def ifftc_axis(x: np.ndarray, axis: int) -> np.ndarray:
         np.fft.ifft(np.fft.ifftshift(x, axes=axis), axis=axis, norm="ortho"), axes=axis)
 
 
+def deinterleave_complex(arr: np.ndarray, axis: int) -> np.ndarray:
+    """指定軸の実/虚インターリーブ（[r0,i0,r1,i1,...]）を複素に変換。
+    その軸サイズ 2N → N（複素）。Calgary-Campinas 等の float 実数格納に使う。
+    """
+    axis = axis % arr.ndim
+    if arr.shape[axis] % 2 != 0:
+        raise ValueError(f"real/imag axis {axis} size {arr.shape[axis]} must be even")
+    sr = [slice(None)] * arr.ndim
+    si = [slice(None)] * arr.ndim
+    sr[axis] = slice(0, None, 2)
+    si[axis] = slice(1, None, 2)
+    return (arr[tuple(sr)].astype(np.float32)
+            + 1j * arr[tuple(si)].astype(np.float32)).astype(np.complex64)
+
+
 def detect_layout(shape, enc_x, enc_y, enc_z):
     """4D k空間の軸配置を、ヘッダの encodedSpace(x,y,z) と各軸サイズの一致で推定し、
     標準順 (kz, coil, ky, kx) への並べ替え permutation を返す。判定不能なら None。
@@ -594,7 +609,7 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
                  acq_matrix=None, snr=None, rng=None,
                  flip_x="auto", flip_y="auto", reverse="auto",
                  slab=1, slab_step=None, recon_3d="auto", part_axis=0,
-                 transpose=None) -> int:
+                 transpose=None, real_imag_axis=None) -> int:
     rel = os.path.relpath(path, in_root)
     base = os.path.splitext(rel)[0]            # 例 inter-scan_motion/2022061401_T101
 
@@ -611,6 +626,10 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
 
     # 3D取得か（auto=ヘッダの encodedSpace.z / kspace_encoding_step_2 から判定）
     is3d = meta["is_3d"] if recon_3d == "auto" else (recon_3d == "on")
+
+    # 実/虚インターリーブ（実数格納）→ 複素化（Calgary-Campinas 等）。transpose より先。
+    if real_imag_axis is not None:
+        ks = deinterleave_complex(ks, real_imag_axis)
 
     # k空間の軸配置補正: --transpose 明示 > 3D時の自動推定（ヘッダのマトリクスサイズ一致）
     layout_note = ""
@@ -754,6 +773,9 @@ def main() -> None:
     ap.add_argument("--transpose", default=None,
                     help="k空間の軸を明示的に並べ替える permutation（例 '2,0,3,1'）。"
                          "標準順 (kz/slice, coil, ky, kx) へ。inspect_h5.py で軸を確認")
+    ap.add_argument("--real-imag-axis", type=int, default=None,
+                    help="実/虚インターリーブ軸（実数格納の複素データ）。その軸 2N→N に複素化。"
+                         "Calgary-Campinas は最後の軸（例 -1）。--transpose より先に適用")
     args = ap.parse_args()
 
     fmt_map = {
@@ -789,7 +811,7 @@ def main() -> None:
                                reverse=args.reverse_slices,
                                slab=args.slab, slab_step=args.slab_step,
                                recon_3d=args.recon_3d, part_axis=args.part_axis,
-                               transpose=transpose)
+                               transpose=transpose, real_imag_axis=args.real_imag_axis)
             records.append(rec)
             n_slices += rec["n_slices"]
             n_files += 1

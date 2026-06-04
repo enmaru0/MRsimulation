@@ -70,6 +70,27 @@ python recon_motion.py --in-root <dir> --out-root out --transpose 2,3,0,1
 - 合成3Dファントムのラウンドトリップで検証済み（標準/非標準レイアウトとも相対誤差 ~1e-7）。
   2D 取得は自動で従来どおり面内のみ IFFT（回帰確認済み）。
 
+### 実/虚インターリーブ格納（Calgary-Campinas など）
+
+`dtype` が **実数(float)** の k空間は、複素が **実/虚インターリーブ**（`[r0,i0,r1,i1,...]`）で
+格納されていることが多い。`--real-imag-axis N` でその軸を複素化する（軸サイズ `2C → C` コイル）。
+
+**Calgary-Campinas（CC-359）3D脳・12ch** は典型例: `kspace shape=(256, 218, 170, 24)` float32・
+ヘッダ無し。`24 = 12コイル×2(実/虚)`、軸構成 `(スライス, ky, kx, coil×2)`、第1軸は既に画像領域。
+
+```bash
+# inspect で形式を確認（CC形式なら推奨コマンドも表示）
+python inspect_h5.py Calgary-campinas/test
+
+# 複素化(24→12coil) → (slice,coil,ky,kx) へ並べ替え → 2D再構成
+python recon_motion.py --in-root Calgary-campinas/test --out-root cc_out \
+    --real-imag-axis -1 --transpose 0,3,1,2 --format png
+```
+
+`--real-imag-axis` は `--transpose` より先に適用される（複素化後の軸番号で transpose を指定）。
+合成CCデータのラウンドトリップで検証済み（相対誤差 ~1e-7）。
+もし第1軸が画像領域でなく k空間（真の3D）なら `--recon-3d on --part-axis 0` を追加して比較する。
+
 > このリポジトリの既存データ（brain/gre/knee）はすべて 2D マルチスライス取得。3D データは
 > このPCには無いが、上記の自動判定＋3D IFFT で再構成できるよう実装・検証してある。
 
