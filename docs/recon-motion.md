@@ -99,9 +99,14 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
 
 3Dボリュームを **2byte 直接バイナリ**で保存する。1 h5 = 同名3ファイル。
 
-- **`.raw`** — `uint16` リトルエンディアン。並びは **x が最速 → y → z**（C順, shape `(z,y,x)`）。
-  画素値は magnitude を max→約65000 にスケールした整数。
+- **`.raw`** — **`int16`（符号付き short）** リトルエンディアン。並びは **x が最速 → y → z**
+  （C順, shape `(z,y,x)`）。画素値は magnitude を **max→32000** にスケールした整数
+  （`.hdr` の「2byte」を符号付き short として読むビューアで**オーバーフローしない**よう、
+  int16範囲 ±32767 内に収める）。スケールは各ボリュームの実最大値基準なので、
+  低磁場処理(acq-matrix/ノイズ)で値が増えても飽和しない。
   `magnitude = stored * rescale_slope`（`rescale_slope` は `.tag` に記載）。
+- **向き** — 多くの `.raw` ビューアは行原点が下(bottom-up)なので、**既定で y(行) を反転**して
+  上下が正しく表示されるようにしている（`--raw-no-flip-y` で無効化可）。
 - **`.hdr`** — 1行テキスト、半角スペース区切り（末尾にもスペース1個）:
 
   ```
@@ -110,16 +115,16 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
 
   例: `256 256 18 2 0.9375 0.9375 6 `（`2` は1ボクセル2byteの意）。
 - **`.tag`** — 各種メタ情報を `key: value` で記録（acquisition, patient_id, dims_xyz,
-  voxel_spacing_mm_xyz, slice_thickness_mm, spacing_between_slices_mm, data_type, byte_order,
-  voxel_order, intensity_max, rescale_slope, field_strength_T, TR/TE/TI/flip, protocol, sequence,
-  manufacturer, model, institution, 各種UID 等）。
+  voxel_spacing_mm_xyz, slice_thickness_mm, spacing_between_slices_mm, data_type(int16), byte_order,
+  voxel_order(y反転の有無), intensity_max, stored_max, rescale_slope, field_strength_T,
+  TR/TE/TI/flip, protocol, sequence, manufacturer, model, institution, 各種UID 等）。
 
 読み込み例（Python）:
 
 ```python
 import numpy as np
 nx, ny, nz, bpp, dx, dy, dz = open("vol.hdr").read().split()
-vol = np.fromfile("vol.raw", dtype="<u2").reshape(int(nz), int(ny), int(nx))  # (z,y,x)
+vol = np.fromfile("vol.raw", dtype="<i2").reshape(int(nz), int(ny), int(nx))  # int16, (z,y,x)
 ```
 
 ## 使い方
@@ -153,6 +158,7 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--acq-matrix` | — | 低磁場: 取得マトリクスを N か R,C へ（k空間中央クロップ＋ゼロ詰め、出力画素数不変） |
 | `--lowfield-snr` | — | 低磁場: 目標SNRまでノイズ付加（単コイル厳密/マルチコイル近似） |
 | `--seed` | `0` | `--lowfield-snr` のノイズ乱数シード |
+| `--raw-no-flip-y` | off | binary(.raw)の行(y)反転をしない（既定は反転して上下を合わせる） |
 
 ## 注意
 
