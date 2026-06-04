@@ -18,7 +18,11 @@ gre_data_png/
 singlecoil_test/
 singlecoil_test_png/
 singlecoil_test_lf192_png/
+knee_multicoil_test/
+knee_multicoil_test_png/
+knee_multicoil_test_2dsim_png/
 *.h5
+*.tar
 *.raw
 *.hdr
 *.tag

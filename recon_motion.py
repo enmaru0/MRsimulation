@@ -42,9 +42,12 @@ patientPosition(HFS/FFS)のみ。これでスライス積層方向を決め、ra
 変換後、出力ルートに summary.csv（症例ごと1行：タグ/ジオメトリ/シーケンス/rescale_slope/
 向き/低磁場設定 等）を出力する。
 
+2D 厚スライスのシミュレーション: --slab N で連続 N 枚の薄スライスを矩形プロファイルで
+合成し厚 2D スライス化する（3D薄スライス積層→擬似2D。mri_slice_sim.py の方針に準拠）。
+
 対応形式
 --------
-- マルチコイル(brain): kspace (slices, coils, H, W)。コイル RSS。
+- マルチコイル(brain/knee): kspace (slices, coils, H, W)。コイル RSS。
 - 単コイル(knee): kspace (slices, H, W)。|IFFT|。reconSpace へ中央クロップ、
   アンダーサンプリング(mask)はゼロ詰め再構成。
 ヘッダの reconSpace マトリクスに合わせて IFFT 後に中央クロップする（例 640x368→320x320）。
@@ -143,6 +146,24 @@ def apply_orient(vol: np.ndarray, flip_x: bool, flip_y: bool, reverse_slices: bo
     if flip_x:
         vol = vol[:, :, ::-1]
     return np.ascontiguousarray(vol)
+
+
+def combine_slab(vol: np.ndarray, n: int, step: int | None = None) -> np.ndarray:
+    """N 枚の薄スライスを矩形(rect)プロファイルで合成し、厚い 2D スライスを作る。
+
+    3D ボリューム（薄スライス積層）から擬似 2D 厚スライスをシミュレートする。
+    各出力スライス = 連続 N 枚の等重み平均（rect スライスプロファイル、総和1で正規化）。
+    本プロジェクト mri_slice_sim.py の方針（magnitude・同コントラスト・矩形プロファイル）に準拠。
+    step を指定すると重なりスラブも可（既定 step=N で非重複）。
+    """
+    if n <= 1:
+        return vol
+    step = step or n
+    nz = vol.shape[0]
+    out = [vol[s:s + n].mean(axis=0) for s in range(0, nz - n + 1, step)]
+    if not out:                                   # N がスライス数より大きい場合は全平均1枚
+        out = [vol.mean(axis=0)]
+    return np.ascontiguousarray(np.stack(out, axis=0))
 
 
 # ----------------------------- 再構成 -----------------------------
@@ -498,7 +519,8 @@ def save_binary(vol: np.ndarray, rescale_slope: float, data_max: float, meta: di
 
 def process_file(path: str, in_root: str, out_root: str, fmts: set,
                  acq_matrix=None, snr=None, rng=None,
-                 flip_x="auto", flip_y="auto", reverse="auto") -> int:
+                 flip_x="auto", flip_y="auto", reverse="auto",
+                 slab=1, slab_step=None) -> int:
     rel = os.path.relpath(path, in_root)
     base = os.path.splitext(rel)[0]            # 例 inter-scan_motion/2022061401_T101
 
@@ -521,6 +543,19 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
     rss = apply_orient(rss, fx, fy, rev)
     orient_note = (f"patient_position={meta.get('patient_position') or '?'}; "
                    f"flip_x={fx} flip_y={fy} reverse_slices={rev}")
+
+    # 2D 厚スライスのシミュレーション（薄スライスを矩形プロファイルで合成）
+    if slab and slab > 1:
+        n0 = rss.shape[0]
+        rss = combine_slab(rss, slab, slab_step)
+        step = slab_step or slab
+        if meta.get("spacing"):
+            meta = dict(meta)
+            meta["thickness"] = float(meta["thickness"]) * slab     # 厚み≈N×元厚
+            meta["spacing"] = float(meta["spacing"]) * step         # 間隔≈step×元間隔
+        lf_slab = f" slab={slab}({n0}->{rss.shape[0]}枚)"
+    else:
+        lf_slab = ""
 
     data_max = float(rss.max())
     vmax = attr_max if attr_max is not None else data_max     # PNG 正規化用
@@ -548,7 +583,7 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
 
     print(f"[ok] {rel}  ({acq}, {meta.get('patient_position') or '?'})  "
           f"{rss.shape[0]} slices {rss.shape[1]}x{rss.shape[2]}  "
-          f"[{'+'.join(sorted(fmts))}]{lf}  rev_slices={rev}")
+          f"[{'+'.join(sorted(fmts))}]{lf}{lf_slab}  rev_slices={rev}")
 
     nz, ny, nx = rss.shape
     return {
@@ -579,6 +614,7 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
         "stored_max": int(round(data_max / rescale_slope)),
         "formats": "+".join(sorted(fmts)),
         "flip_x": fx, "flip_y": fy, "reverse_slices": rev,
+        "slab": slab if slab and slab > 1 else "",
         "acq_matrix": f"{acq_matrix[0]}x{acq_matrix[1]}" if acq_matrix else "",
         "lowfield_snr": snr if snr is not None else "",
         "series_uid": meta.get("series_uid") or "",
@@ -611,6 +647,11 @@ def main() -> None:
     ap.add_argument("--reverse-slices", choices=["auto", "on", "off"], default="auto",
                     help="スライス積層方向の反転。auto=patientPosition由来"
                          "（Head-First:ON / Feet-First:OFF）")
+    # 2D 厚スライスのシミュレーション（3D薄スライス積層 → 厚2D）
+    ap.add_argument("--slab", type=int, default=1,
+                    help="N枚の薄スライスを矩形プロファイルで合成し厚2Dスライス化（既定1=無し）")
+    ap.add_argument("--slab-step", type=int, default=None,
+                    help="スラブの送り（既定=--slab で非重複）")
     args = ap.parse_args()
 
     fmt_map = {
@@ -642,7 +683,8 @@ def main() -> None:
             rec = process_file(p, args.in_root, args.out_root, fmts,
                                acq_matrix=acq_matrix, snr=args.lowfield_snr, rng=rng,
                                flip_x=args.flip_x, flip_y=args.flip_y,
-                               reverse=args.reverse_slices)
+                               reverse=args.reverse_slices,
+                               slab=args.slab, slab_step=args.slab_step)
             records.append(rec)
             n_slices += rec["n_slices"]
             n_files += 1

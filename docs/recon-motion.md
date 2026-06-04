@@ -67,6 +67,34 @@ python recon_motion.py --in-root singlecoil_test --out-root singlecoil_lf \
 > 厳密にノイズ/コントラストを実低磁場へ合わせるなら、再構成画像(DICOM)を
 > [`lowfield_sim.py`](lowfield.md) に通す方法もある。
 
+## 2D 厚スライスのシミュレーション（`--slab`）
+
+薄スライス積層の3Dボリュームから、**擬似 2D 厚スライス**を再構成する。`--slab N` は
+**連続 N 枚を矩形(rect)スライスプロファイルで合成**（等重み平均、総和1で正規化）して
+1枚の厚スライスにする。3D薄スライス→2D厚スライスの簡易版で、
+[`mri_slice_sim.py`](slice-simulation.md) の方針（magnitude・同コントラスト・矩形プロファイル）に準拠。
+
+| オプション | 既定 | 説明 |
+|---|---|---|
+| `--slab N` | `1`（無し） | N枚を合成して厚2Dスライス化（厚み≈N×元厚） |
+| `--slab-step M` | `=N` | スラブの送り。`M<N` で重なりスラブ |
+
+```bash
+# 38枚の薄スライス → 5枚ずつ rect 合成して厚2Dスライス（≈7枚）に
+python recon_motion.py --in-root knee_multicoil_test --out-root knee_2dsim --slab 5
+
+# 重なりスラブ（N=5, step=2）でスライス数を保ちつつ厚みだけ増やす
+python recon_motion.py --in-root knee_multicoil_test --out-root knee_2dsim_ov --slab 5 --slab-step 2
+```
+
+出力 DICOM/binary の `SliceThickness`/`SpacingBetweenSlices` は合成枚数ぶん厚く更新される。
+スライス方向に平均化されるため、through-plane の構造はなだらかになり厚スライス2D像に近づく。
+
+> 注: これは**再構成後の magnitude を空間領域で合成**する簡易法。真の 2D 励起（厚いRFスラブ）や
+> 部分容積での位相打ち消しは扱わない（[制約](slice-simulation.md#制約と注意) は mri_slice_sim と同様）。
+> なお本データ(`knee_multicoil_test`)は 2D マルチスライス取得＋8倍アンダーサンプリングのため、
+> 元の薄スライスにエイリアスが残る。
+
 ## 出力形式（`--format`）
 
 | 値 | 出力 |
@@ -215,6 +243,8 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--flip-y` | `auto` | 行(上下)反転 auto(=ON)/on/off。raw/DICOM/PNG 共通 |
 | `--flip-x` | `auto` | 列(左右)反転 auto(=OFF)/on/off |
 | `--reverse-slices` | `auto` | スライス方向反転 auto(=patientPosition由来)/on/off |
+| `--slab` | `1` | N枚を rect 合成して厚2Dスライス化（2Dシミュレーション） |
+| `--slab-step` | `=N` | スラブの送り（`<N` で重なり） |
 
 ## 注意
 
