@@ -8,6 +8,15 @@ SampleData_*/
 *.DCM
 *.dcm
 
+# k-space data & reconstructions (patient data — do not commit)
+motion/
+motion_png/
+multicoil_test/
+multicoil_test_png/
+gre_data/
+gre_data_png/
+*.h5
+
 # Simulation outputs
 out_sim/
 out_*/
