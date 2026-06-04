@@ -94,6 +94,9 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
 - **画素**: uint16（max→約65000 にスケール）。`RescaleSlope` を設定するので
   `pixel_array * RescaleSlope` で**元の magnitude を復元可能**（量子化誤差 ~1e-5）。
   派生画像であることを `ImageType = [DERIVED, SECONDARY]` で明示
+- **向き補正（既定ON）**: 行(y)を反転（上下を合わせる）し、スライス積層方向（InstanceNumber /
+  `ImagePositionPatient` の z 向き）を反転する。ビューアで上下・スライス順が逆になる問題を解消。
+  `--dicom-no-flip-y` / `--dicom-no-reverse-slices` で各々無効化できる。
 
 ### binary（`.raw` / `.hdr` / `.tag`）
 
@@ -107,13 +110,13 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
   `magnitude = stored * rescale_slope`（`rescale_slope` は `.tag` に記載）。
 - **向き** — 多くの `.raw` ビューアは行原点が下(bottom-up)なので、**既定で y(行) を反転**して
   上下が正しく表示されるようにしている（`--raw-no-flip-y` で無効化可）。
-- **`.hdr`** — 1行テキスト、半角スペース区切り（末尾にもスペース1個）:
+- **`.hdr`** — 1行テキスト、半角スペース区切り（末尾スペースなし）:
 
   ```
   Xサイズ Yサイズ Zサイズ 2 X物理スペーシング(mm) Y物理スペーシング(mm) Z物理スペーシング(mm)
   ```
 
-  例: `256 256 18 2 0.9375 0.9375 6 `（`2` は1ボクセル2byteの意）。
+  例: `256 256 18 2 0.9375 0.9375 6`（`2` は1ボクセル2byteの意）。
 - **`.tag`** — 各種メタ情報を `key: value` で記録（acquisition, patient_id, dims_xyz,
   voxel_spacing_mm_xyz, slice_thickness_mm, spacing_between_slices_mm, data_type(int16), byte_order,
   voxel_order(y反転の有無), intensity_max, stored_max, rescale_slope, field_strength_T,
@@ -159,6 +162,8 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--lowfield-snr` | — | 低磁場: 目標SNRまでノイズ付加（単コイル厳密/マルチコイル近似） |
 | `--seed` | `0` | `--lowfield-snr` のノイズ乱数シード |
 | `--raw-no-flip-y` | off | binary(.raw)の行(y)反転をしない（既定は反転して上下を合わせる） |
+| `--dicom-no-flip-y` | off | DICOMの行(y)反転をしない（既定は反転して上下を合わせる） |
+| `--dicom-no-reverse-slices` | off | DICOMのスライス方向反転をしない（既定は反転して積層方向を合わせる） |
 
 ## 注意
 

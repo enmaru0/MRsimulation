@@ -248,8 +248,20 @@ def save_png(vol: np.ndarray, vmax: float, out_dir: str) -> None:
 
 
 def save_dicom(vol: np.ndarray, vmax: float, meta: dict, basename: str,
-               patient_id: str, acquisition: str, out_dir: str) -> None:
-    """再構成 magnitude を MR Image Storage DICOM 群として書き出す。"""
+               patient_id: str, acquisition: str, out_dir: str,
+               flip_y: bool = True, reverse_slices: bool = True) -> None:
+    """再構成 magnitude を MR Image Storage DICOM 群として書き出す。
+
+    向き補正（既定ON）:
+    - flip_y: 行(y)を反転（上下を合わせる。raw と同方向）
+    - reverse_slices: スライス積層方向を反転（InstanceNumber/IPP-z の向きを合わせる）
+    """
+    if flip_y:
+        vol = vol[:, ::-1, :]
+    if reverse_slices:
+        vol = vol[::-1, :, :]
+    vol = np.ascontiguousarray(vol)
+
     n, nrows, ncols = vol.shape
     dx = meta["dx"] or 1.0          # 列方向(x)画素間隔 mm
     dy = meta["dy"] or 1.0          # 行方向(y)画素間隔 mm
@@ -386,9 +398,9 @@ def save_binary(vol: np.ndarray, vmax: float, meta: dict, basename: str,
     with open(out_base + ".raw", "wb") as f:
         f.write(np.ascontiguousarray(stored).tobytes())   # C順: 最終軸 x が最速
 
-    # .hdr （指定フォーマット: サイズ x y z, 2byte, 物理スペーシング x y z, 末尾スペース）
+    # .hdr （サイズ x y z, 2byte, 物理スペーシング x y z。末尾スペースなし）
     with open(out_base + ".hdr", "w") as f:
-        f.write(f"{nx} {ny} {nz} 2 {dx:g} {dy:g} {dz:g} ")
+        f.write(f"{nx} {ny} {nz} 2 {dx:g} {dy:g} {dz:g}")
 
     # .tag （各種情報）
     slope = 1.0 / scale                          # stored*slope = 元 magnitude
@@ -430,7 +442,8 @@ def save_binary(vol: np.ndarray, vmax: float, meta: dict, basename: str,
 
 
 def process_file(path: str, in_root: str, out_root: str, fmts: set,
-                 acq_matrix=None, snr=None, rng=None, raw_flip_y=True) -> int:
+                 acq_matrix=None, snr=None, rng=None, raw_flip_y=True,
+                 dicom_flip_y=True, dicom_reverse_slices=True) -> int:
     rel = os.path.relpath(path, in_root)
     base = os.path.splitext(rel)[0]            # 例 inter-scan_motion/2022061401_T101
 
@@ -461,7 +474,8 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
         if "png" in fmts:
             save_png(rss, vmax, out_dir)
         if "dicom" in fmts:
-            save_dicom(rss, vmax, meta, os.path.basename(base), pid, acq, out_dir)
+            save_dicom(rss, vmax, meta, os.path.basename(base), pid, acq, out_dir,
+                       flip_y=dicom_flip_y, reverse_slices=dicom_reverse_slices)
 
     # binary は 1 ボリューム = <out_root>/<base>.raw/.hdr/.tag
     if "binary" in fmts:
@@ -492,6 +506,10 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0, help="ノイズ乱数シード")
     ap.add_argument("--raw-no-flip-y", action="store_true",
                     help="binary(.raw)出力で行(y)反転をしない（既定は反転して上下を合わせる）")
+    ap.add_argument("--dicom-no-flip-y", action="store_true",
+                    help="DICOM出力で行(y)反転をしない（既定は反転して上下を合わせる）")
+    ap.add_argument("--dicom-no-reverse-slices", action="store_true",
+                    help="DICOM出力でスライス方向を反転しない（既定は反転して積層方向を合わせる）")
     args = ap.parse_args()
 
     fmt_map = {
@@ -521,7 +539,9 @@ def main() -> None:
         try:
             n_slices += process_file(p, args.in_root, args.out_root, fmts,
                                      acq_matrix=acq_matrix, snr=args.lowfield_snr, rng=rng,
-                                     raw_flip_y=not args.raw_no_flip_y)
+                                     raw_flip_y=not args.raw_no_flip_y,
+                                     dicom_flip_y=not args.dicom_no_flip_y,
+                                     dicom_reverse_slices=not args.dicom_no_reverse_slices)
             n_files += 1
         except Exception as e:  # noqa: BLE001
             print(f"[skip] {p}: {e}")
