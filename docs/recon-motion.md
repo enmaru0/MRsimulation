@@ -96,9 +96,8 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
   **元の magnitude を正確に復元可能**。`WindowCenter/Width` も rescale 後（magnitude）単位で設定。
   振幅がデータセットで桁違い（ブレイン ~1e2、単コイル膝 ~1e-4）でも自動で適正スケールに収める。
   派生画像であることを `ImageType = [DERIVED, SECONDARY]` で明示
-- **向き補正（既定ON）**: 行(y)を反転（上下を合わせる）し、スライス積層方向（InstanceNumber /
-  `ImagePositionPatient` の z 向き）を反転する。ビューアで上下・スライス順が逆になる問題を解消。
-  `--dicom-no-flip-y` / `--dicom-no-reverse-slices` で各々無効化できる。
+- **向き**: ボリュームは出力前に [向き補正](#向きpatientposition由来) 済み。`PatientPosition`
+  タグにはヘッダ値（HFS/FFS 等）を格納する。
 
 ### binary（`.raw` / `.hdr` / `.tag`）
 
@@ -109,8 +108,7 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
   ~1000-3000台。従来の32000は過大だった）。`rescale_slope` は10のべき乗で `.tag` に記載し、
   `magnitude = stored * rescale_slope` で**実信号を正確に復元**できる。値は int16範囲(±32767)内に
   収まるので、2byteを符号付きshortで読むビューアでも**オーバーフローしない**。
-- **向き** — 多くの `.raw` ビューアは行原点が下(bottom-up)なので、**既定で y(行) を反転**して
-  上下が正しく表示されるようにしている（`--raw-no-flip-y` で無効化可）。
+- **向き** — 出力前に [向き補正](#向きpatientposition由来) 済み（raw/DICOM/PNG で一貫）。
 - **`.hdr`** — 1行テキスト、半角スペース区切り（末尾スペースなし）:
 
   ```
@@ -132,6 +130,37 @@ vol = np.fromfile("vol.raw", dtype="<i2").reshape(int(nz), int(ny), int(nx))  # 
 magnitude = vol * rescale_slope            # rescale_slope は .tag / summary.csv に記載
 ```
 
+## 向き（patientPosition由来）
+
+スライス方向や上下が**入力データによって反転**するのは、データセットで `patientPosition` が
+異なるため（例: ブレイン系は **HFS**=Head First Supine、単コイル膝は **FFS**=Feet First Supine。
+HFS と FFS では S-I（スライス）と L-R が逆になる）。
+
+> **重要**: この簡易 fastMRI 形式（`.h5`）には**スライスごとの
+> `ImageOrientationPatient` / `ImagePositionPatient` は含まれていない**（フル ISMRMRD の
+> acquisition ヘッダにあるが、ここには非エクスポート）。参照できる向き情報は
+> `ismrmrd_header` の **`patientPosition`** と FOV/マトリクスのみ。そこで patientPosition から
+> スライス積層方向を決め、**raw / DICOM / PNG すべてで同じ向き**に揃える。
+
+自動（`auto`）の既定:
+
+| 補正 | auto の挙動 |
+|---|---|
+| `--flip-y`（行=上下） | **ON**（撮像面に依らず supine なら anterior が上に揃う） |
+| `--reverse-slices`（スライス積層方向） | **patientPosition 由来**: Head-First→ON / Feet-First→OFF |
+| `--flip-x`（列=左右） | **OFF** |
+
+各フラグは `auto` / `on` / `off` で明示上書きできる（例: 特定ビューアの慣習に合わせて
+`--reverse-slices off`）。適用した向きは `.tag` の `orientation` 行と `summary.csv`
+（`patient_position` / `flip_x` / `flip_y` / `reverse_slices` 列）に記録される。
+
+```bash
+# patientPosition に従って自動で向きを揃える（既定）
+python recon_motion.py --in-root singlecoil_test --out-root out --format all
+# スライス方向を強制的に反転しない
+python recon_motion.py --in-root gre_data --out-root out --reverse-slices off
+```
+
 ## summary.csv（症例ごとのまとめ）
 
 変換のたび、出力ルート直下に **`summary.csv`** を生成する（**1症例＝1行**）。
@@ -140,13 +169,14 @@ magnitude = vol * rescale_slope            # rescale_slope は .tag / summary.cs
 | 列 | 内容 |
 |---|---|
 | `file` / `basename` | 入力 h5 の相対パス / ベース名 |
-| `acquisition` / `patient_id` | コントラスト種別 / 患者ID(ハッシュ) |
+| `acquisition` / `patient_id` / `patient_position` | コントラスト種別 / 患者ID(ハッシュ) / HFS・FFS等 |
 | `n_slices` / `nx,ny,nz` | スライス数 / 出力次元 |
 | `dx_mm,dy_mm,dz_mm` / `slice_thickness_mm` / `spacing_mm` | 物理スペーシング・厚み |
 | `field_strength_T` / `TR_ms,TE_ms,TI_ms,flip_deg` | 磁場強度・シーケンスパラメータ |
 | `protocol` / `sequence` / `manufacturer` / `model` / `institution` | 撮像プロトコル・装置 |
 | `intensity_max` / `rescale_slope` / `stored_max` | 信号最大・rescale係数・格納整数の最大 |
 | `formats` / `acq_matrix` / `lowfield_snr` | 出力形式 / 低磁場の取得マトリクス・SNR |
+| `flip_x` / `flip_y` / `reverse_slices` | 適用した向き補正 |
 | `series_uid` / `study_uid` | UID |
 
 `magnitude = stored_value * rescale_slope` で実信号を復元できる（列 `rescale_slope`）。
@@ -182,9 +212,9 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--acq-matrix` | — | 低磁場: 取得マトリクスを N か R,C へ（k空間中央クロップ＋ゼロ詰め、出力画素数不変） |
 | `--lowfield-snr` | — | 低磁場: 目標SNRまでノイズ付加（単コイル厳密/マルチコイル近似） |
 | `--seed` | `0` | `--lowfield-snr` のノイズ乱数シード |
-| `--raw-no-flip-y` | off | binary(.raw)の行(y)反転をしない（既定は反転して上下を合わせる） |
-| `--dicom-no-flip-y` | off | DICOMの行(y)反転をしない（既定は反転して上下を合わせる） |
-| `--dicom-no-reverse-slices` | off | DICOMのスライス方向反転をしない（既定は反転して積層方向を合わせる） |
+| `--flip-y` | `auto` | 行(上下)反転 auto(=ON)/on/off。raw/DICOM/PNG 共通 |
+| `--flip-x` | `auto` | 列(左右)反転 auto(=OFF)/on/off |
+| `--reverse-slices` | `auto` | スライス方向反転 auto(=patientPosition由来)/on/off |
 
 ## 注意
 
