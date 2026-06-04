@@ -91,8 +91,10 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
   `Manufacturer`/`ManufacturerModelName`, `ProtocolName`, `SequenceName`
 - **UID**: ヘッダの `seriesInstanceUID`/`studyUID`/`frameOfReferenceUID` を使用（妥当でなければ自動生成）、
   `SOPInstanceUID` はスライスごとに採番
-- **画素**: uint16（max→約65000 にスケール）。`RescaleSlope` を設定するので
-  `pixel_array * RescaleSlope` で**元の magnitude を復元可能**（量子化誤差 ~1e-5）。
+- **画素**: 格納整数 = `round(magnitude / RescaleSlope)`（控えめなスケール、~1000-3000台）。
+  `RescaleSlope` をボリュームごとに設定するので `pixel_array * RescaleSlope` で
+  **元の magnitude を正確に復元可能**。`WindowCenter/Width` も rescale 後（magnitude）単位で設定。
+  振幅がデータセットで桁違い（ブレイン ~1e2、単コイル膝 ~1e-4）でも自動で適正スケールに収める。
   派生画像であることを `ImageType = [DERIVED, SECONDARY]` で明示
 - **向き補正（既定ON）**: 行(y)を反転（上下を合わせる）し、スライス積層方向（InstanceNumber /
   `ImagePositionPatient` の z 向き）を反転する。ビューアで上下・スライス順が逆になる問題を解消。
@@ -103,11 +105,10 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
 3Dボリュームを **2byte 直接バイナリ**で保存する。1 h5 = 同名3ファイル。
 
 - **`.raw`** — **`int16`（符号付き short）** リトルエンディアン。並びは **x が最速 → y → z**
-  （C順, shape `(z,y,x)`）。画素値は magnitude を **max→32000** にスケールした整数
-  （`.hdr` の「2byte」を符号付き short として読むビューアで**オーバーフローしない**よう、
-  int16範囲 ±32767 内に収める）。スケールは各ボリュームの実最大値基準なので、
-  低磁場処理(acq-matrix/ノイズ)で値が増えても飽和しない。
-  `magnitude = stored * rescale_slope`（`rescale_slope` は `.tag` に記載）。
+  （C順, shape `(z,y,x)`）。画素値 = `round(magnitude / rescale_slope)`（控えめなスケール、
+  ~1000-3000台。従来の32000は過大だった）。`rescale_slope` は10のべき乗で `.tag` に記載し、
+  `magnitude = stored * rescale_slope` で**実信号を正確に復元**できる。値は int16範囲(±32767)内に
+  収まるので、2byteを符号付きshortで読むビューアでも**オーバーフローしない**。
 - **向き** — 多くの `.raw` ビューアは行原点が下(bottom-up)なので、**既定で y(行) を反転**して
   上下が正しく表示されるようにしている（`--raw-no-flip-y` で無効化可）。
 - **`.hdr`** — 1行テキスト、半角スペース区切り（末尾スペースなし）:
@@ -128,7 +129,27 @@ binary は**1ボリューム3点セット** `<out_root>/<basename>.raw/.hdr/.tag
 import numpy as np
 nx, ny, nz, bpp, dx, dy, dz = open("vol.hdr").read().split()
 vol = np.fromfile("vol.raw", dtype="<i2").reshape(int(nz), int(ny), int(nx))  # int16, (z,y,x)
+magnitude = vol * rescale_slope            # rescale_slope は .tag / summary.csv に記載
 ```
+
+## summary.csv（症例ごとのまとめ）
+
+変換のたび、出力ルート直下に **`summary.csv`** を生成する（**1症例＝1行**）。
+各 h5 のタグ・ジオメトリ・シーケンス情報と、今回の変換設定をまとめる。主な列:
+
+| 列 | 内容 |
+|---|---|
+| `file` / `basename` | 入力 h5 の相対パス / ベース名 |
+| `acquisition` / `patient_id` | コントラスト種別 / 患者ID(ハッシュ) |
+| `n_slices` / `nx,ny,nz` | スライス数 / 出力次元 |
+| `dx_mm,dy_mm,dz_mm` / `slice_thickness_mm` / `spacing_mm` | 物理スペーシング・厚み |
+| `field_strength_T` / `TR_ms,TE_ms,TI_ms,flip_deg` | 磁場強度・シーケンスパラメータ |
+| `protocol` / `sequence` / `manufacturer` / `model` / `institution` | 撮像プロトコル・装置 |
+| `intensity_max` / `rescale_slope` / `stored_max` | 信号最大・rescale係数・格納整数の最大 |
+| `formats` / `acq_matrix` / `lowfield_snr` | 出力形式 / 低磁場の取得マトリクス・SNR |
+| `series_uid` / `study_uid` | UID |
+
+`magnitude = stored_value * rescale_slope` で実信号を復元できる（列 `rescale_slope`）。
 
 ## 使い方
 

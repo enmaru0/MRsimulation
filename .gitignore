@@ -22,6 +22,7 @@ singlecoil_test_lf192_png/
 *.raw
 *.hdr
 *.tag
+summary.csv
 
 # Simulation outputs
 out_sim/
