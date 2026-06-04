@@ -2,36 +2,70 @@
 
 # k-space からの再構成 (`recon_motion.py`)
 
-fastMRI 形式のマルチコイル k-space（`.h5`）を画像に再構成し、**PNG / DICOM / binary(.raw)** で
-出力するツール。`motion/`・`multicoil_test/`・`gre_data/` など、同形式のフォルダすべてに使える。
+fastMRI 形式の k-space（`.h5`）を画像に再構成し、**PNG / DICOM / binary(.raw)** で
+出力するツール。**マルチコイル(brain)** と **単コイル(knee)** の両形式に対応し、
+`motion/`・`multicoil_test/`・`gre_data/`・`singlecoil_test/` などに使える。
 
-## 入力データ形式（fastMRI brain multicoil）
+## 入力データ形式
 
-各 `.h5` ファイルは以下を持つ:
+| データ | `kspace` | 再構成 | 備考 |
+|---|---|---|---|
+| **マルチコイル(brain)** | `(slices, coils, H, W)` complex64 | コイル RSS、出力=encoded サイズ | `reconstruction_rss`(正解) 同梱 |
+| **単コイル(knee)** | `(slices, H, W)` complex64 | `|IFFT|`、reconSpace へ中央クロップ | `mask` でアンダーサンプリング(ゼロ詰め再構成) |
 
-| キー | 内容 |
-|---|---|
-| `kspace` | `(slices, coils, H, W)` complex64 の生 k-space |
-| `reconstruction_rss` | `(slices, H, W)` float32 の正解再構成（検証用） |
-| `ismrmrd_header` | 撮像ジオメトリ/シーケンス情報（FOV・厚・間隔・TR/TE/TI・FA・磁場強度・各種UID） |
-| attrs | `acquisition`（AXT1/AXT2/AXFLAIR/AXGRE 等）, `max`, `patient_id` |
+両形式とも `ismrmrd_header`（FOV・厚・間隔・TR/TE/TI・FA・磁場強度・UID）と attrs
+（`acquisition`, `patient_id`, brain は `max`）を持つ。
 
 ## 再構成アルゴリズム
 
-各コイルを **中心化 2D 逆FFT**（`ifftshift → ifft2(norm="ortho") → fftshift`）し、
-コイル方向に **root-sum-of-squares (RSS)** で合成する:
+**中心化 2D 逆FFT**（`ifftshift → ifft2(norm="ortho") → fftshift`）したのち、
+マルチコイルは **root-sum-of-squares (RSS)**、単コイルは絶対値で magnitude を作る:
 
 ```
 img_c = ifft2c(kspace_c)                       # コイルごとの複素画像
-rss   = sqrt( Σ_c |img_c|² )                   # コイル合成 magnitude
+mag   = sqrt( Σ_c |img_c|² )  (multicoil)      # コイル合成 magnitude
+mag   = |ifft2c(kspace)|       (single coil)
 ```
 
-これは fastMRI 標準手法で、付属の `reconstruction_rss` を**厳密に再現**する
+最後に `ismrmrd_header` の **reconSpace マトリクスへ中央クロップ**する（例 単コイル膝
+640×368 → 320×320。マルチコイル brain は encoded=recon=256 でクロップ無し）。
+
+マルチコイルは fastMRI 標準手法で、付属の `reconstruction_rss` を**厳密に再現**する
 （検証で相対誤差 ~1e-7）。モーションアーチファクト（位相エンコード方向のゴースト/ブレ）は
 そのまま画像に現れるので、モーション補正アルゴリズムの評価データにもなる。
+単コイル膝はアンダーサンプリング(acceleration)済みなので、ゼロ詰め再構成にエイリアスが残る。
 
-> 補足: numpy の既定 `ifft2`（norm=`backward`, 1/N 正規化）だと振幅が √(H·W)=256 倍ずれる。
+> 補足: numpy の既定 `ifft2`（norm=`backward`, 1/N 正規化）だと振幅が √(H·W) 倍ずれる。
 > fastMRI と一致させるには **`norm="ortho"` が必須**。
+
+## 低磁場シミュレーション（再構成前・k空間ドメイン）
+
+再構成前に k空間で劣化を与えて「低磁場風」の画像を再構成できる。**出力画像の画素数
+（解像度グリッド）は変えず**、実効解像度／SNR だけを落とす。
+
+| オプション | 処理 | 効果 |
+|---|---|---|
+| `--acq-matrix N`（または `R,C`） | k空間中央を N×N にクロップ→元グリッドへゼロ詰め | **取得マトリクスを N に低下**＝解像度ダウン。出力画素数は不変 |
+| `--lowfield-snr S` | 複素ガウシアンノイズを付加（RSS後 Rician） | 目標 SNR≈S までノイズを増やす |
+| `--seed` | ノイズ乱数シード | データ拡張 |
+
+`--acq-matrix 192` は「取得は192×192だが再構成は元グリッド」のゼロフィル再構成に相当する
+（FOV・PixelSpacing は不変、高周波が無くなりボケる）。実低磁場が低マトリクス取得＋
+ゼロフィル再構成である状況を、最も素直に k空間で再現する。
+
+```bash
+# 取得192×192に落として再構成（出力の画素数は不変）
+python recon_motion.py --in-root singlecoil_test --out-root singlecoil_lf192 --acq-matrix 192
+
+# さらに低磁場ノイズも付加（目標SNR=8）
+python recon_motion.py --in-root singlecoil_test --out-root singlecoil_lf \
+    --acq-matrix 192 --lowfield-snr 8 --seed 0
+```
+
+> `--lowfield-snr` のノイズは**単コイルで厳密**（magnitude Rician）、マルチコイル RSS では
+> コイル結合の都合で **1/√C の一次近似**（おおよそ目標SNRに合うが厳密でない）。
+> 厳密にノイズ/コントラストを実低磁場へ合わせるなら、再構成画像(DICOM)を
+> [`lowfield_sim.py`](lowfield.md) に通す方法もある。
 
 ## 出力形式（`--format`）
 
@@ -92,15 +126,19 @@ vol = np.fromfile("vol.raw", dtype="<u2").reshape(int(nz), int(ny), int(nx))  # 
 
 ```bash
 # PNG（既定）— 全ファイル
-python recon_motion.py --in-root motion         --out-root motion_png
-python recon_motion.py --in-root multicoil_test --out-root multicoil_test_png
-python recon_motion.py --in-root gre_data       --out-root gre_data_png
+python recon_motion.py --in-root motion          --out-root motion_png
+python recon_motion.py --in-root multicoil_test  --out-root multicoil_test_png
+python recon_motion.py --in-root gre_data        --out-root gre_data_png
+python recon_motion.py --in-root singlecoil_test --out-root singlecoil_test_png   # 単コイル膝
 
 # DICOM 出力
 python recon_motion.py --in-root gre_data --out-root gre_data_dicom --format dicom
 
 # binary(.raw/.hdr/.tag) 出力
 python recon_motion.py --in-root gre_data --out-root gre_data_raw --format binary
+
+# 低磁場: 取得192×192へ落として再構成（出力画素数は不変）
+python recon_motion.py --in-root singlecoil_test --out-root singlecoil_lf192 --acq-matrix 192
 
 # 全形式、先頭2ファイルだけ動作確認
 python recon_motion.py --in-root motion --out-root out_check --format all --limit 2
@@ -112,11 +150,15 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--out-root` | `motion_png` | 出力ルート |
 | `--format` | `png` | `png` / `dicom` / `binary` / `both`(=png+dicom) / `all` |
 | `--limit` | `0` | 先頭 N ファイルのみ（0=全部、動作確認用） |
+| `--acq-matrix` | — | 低磁場: 取得マトリクスを N か R,C へ（k空間中央クロップ＋ゼロ詰め、出力画素数不変） |
+| `--lowfield-snr` | — | 低磁場: 目標SNRまでノイズ付加（単コイル厳密/マルチコイル近似） |
+| `--seed` | `0` | `--lowfield-snr` のノイズ乱数シード |
 
 ## 注意
 
 - k-space（`.h5`）と再構成画像（PNG/DICOM/raw）は **患者データ**のため git に push しない
-  （`.gitignore` で `motion*/`・`multicoil_test*/`・`gre_data*/`・`*.h5` を除外済み）。
+  （`.gitignore` で `motion*/`・`multicoil_test*/`・`gre_data*/`・`singlecoil_test*/`・
+  `*.h5`・`*.raw`・`*.hdr`・`*.tag` を除外済み）。
 - DICOM/binary の絶対位置（IPP/原点）は元の患者座標が不明なため **FOV 中心を原点**として再構成している。
   同一ボリューム内のスライス間隔・厚み・面内スケールは header の実値で正しい。
 - 必要パッケージ: `h5py`, `Pillow`（PNG）, `pydicom`（DICOM）。binary は標準ライブラリのみ。

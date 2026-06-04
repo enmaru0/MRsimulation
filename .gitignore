@@ -15,7 +15,13 @@ multicoil_test/
 multicoil_test_png/
 gre_data/
 gre_data_png/
+singlecoil_test/
+singlecoil_test_png/
+singlecoil_test_lf192_png/
 *.h5
+*.raw
+*.hdr
+*.tag
 
 # Simulation outputs
 out_sim/

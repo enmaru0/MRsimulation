@@ -5,7 +5,7 @@ MRI DICOM / k-space から物理的に整合したシミュレーション画像
 - **`mri_slice_sim.py`** — 3D薄スライス → 2D厚スライス（スライスプロファイル積分）
 - **`calibrate.py`** — 実2D/3Dペアからスライスプロファイル等を実測較正・診断
 - **`lowfield_sim.py`** — 高磁場(1.5T/3T) → 低磁場(0.3-0.5T)風の劣化（ノイズ/解像度）
-- **`recon_motion.py`** — fastMRI 形式マルチコイル k-space(`.h5`) → 画像再構成（PNG / DICOM / binary 出力）
+- **`recon_motion.py`** — fastMRI 形式 k-space(`.h5`, マルチコイル/単コイル) → 画像再構成（PNG / DICOM / binary、低磁場シミュレーション付き）
 
 例: 1mmスライス厚の3Dデータ → **5mm厚 / 6mm間隔**の2D画像を、MRIの原理に基づいて生成する。
 
@@ -20,7 +20,7 @@ MRI DICOM / k-space から物理的に整合したシミュレーション画像
 | [3D薄スライス → 2D厚スライス](docs/slice-simulation.md) | `mri_slice_sim.py` | スライスプロファイル積分、出力面(AX/COR/SAG)、プロファイル選択 |
 | [実ペアデータによる較正・検証](docs/calibration.md) | `calibrate.py` | SSP実測、フォワードモデル、面内較正、QA診断 |
 | [高磁場→低磁場シミュレーション](docs/lowfield.md) | `lowfield_sim.py` ほか | ノイズ/解像度劣化、低磁場プロファイル較正、手動ノイズ計測 |
-| [k-spaceからの再構成](docs/recon-motion.md) | `recon_motion.py` | コイルRSS再構成、PNG/DICOM/binary 出力 |
+| [k-spaceからの再構成](docs/recon-motion.md) | `recon_motion.py` | マルチ/単コイル再構成、低磁場シミュレーション、PNG/DICOM/binary 出力 |
 
 ---
 
