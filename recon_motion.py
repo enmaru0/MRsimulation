@@ -50,6 +50,9 @@ patientPosition(HFS/FFS)のみ。これでスライス積層方向を決め、ra
 - マルチコイル(brain/knee): kspace (slices, coils, H, W)。コイル RSS。
 - 単コイル(knee): kspace (slices, H, W)。|IFFT|。reconSpace へ中央クロップ、
   アンダーサンプリング(mask)はゼロ詰め再構成。
+- 真の3D取得: kspace (partitions, coils, H, W)。パーティション(kz)方向も IFFT する
+  3D再構成。ヘッダ(encodedSpace.z>1 / kspace_encoding_step_2>0)で自動判定（--recon-3d）。
+  既定レイアウトは (kz,coil,ky,kx)＝軸0がパーティション（--part-axis で変更可）。
 ヘッダの reconSpace マトリクスに合わせて IFFT 後に中央クロップする（例 640x368→320x320）。
 
 低磁場シミュレーション（任意・k空間ドメイン・再構成前。出力の画素数は不変）
@@ -198,9 +201,22 @@ def kspace_crop_zerofill(ks: np.ndarray, acq_hw) -> np.ndarray:
     return out
 
 
+def ifftc_axis(x: np.ndarray, axis: int) -> np.ndarray:
+    """指定軸に沿った中心化 1D 逆FFT（norm="ortho"）。"""
+    return np.fft.fftshift(
+        np.fft.ifft(np.fft.ifftshift(x, axes=axis), axis=axis, norm="ortho"), axes=axis)
+
+
 def reconstruct(kspace: np.ndarray, recon_size=None, acq_matrix=None,
-                snr: float | None = None, rng=None) -> np.ndarray:
-    """k空間 → magnitude 画像。マルチコイル(S,C,H,W)はRSS、単コイル(S,H,W)は|.|。
+                snr: float | None = None, rng=None,
+                partition_3d: bool = False, recon_z=None,
+                part_axis: int = 0) -> np.ndarray:
+    """k空間 → magnitude 画像。マルチコイル(...,C,H,W)はRSS、単コイル(...,H,W)は|.|。
+
+    既定は面内(最後の2軸)のみ IFFT（2Dマルチスライス）。
+    真の 3D 取得（partition_3d=True）では、パーティション軸 part_axis（既定 0）にも
+    1D 逆FFT を掛ける＝スライス方向も k空間エンコードを復元する。recon_z 指定時は
+    パーティション軸をその枚数へ中央クロップ（スライスオーバーサンプリング除去）。
 
     低磁場シミュレーション（任意・k空間ドメイン、出力画素数は不変）:
     - acq_matrix=(tr,tc): 取得マトリクスを中央クロップで落とす（解像度低下）
@@ -211,7 +227,9 @@ def reconstruct(kspace: np.ndarray, recon_size=None, acq_matrix=None,
     if acq_matrix is not None:
         ks = kspace_crop_zerofill(ks, acq_matrix)
 
-    imgs = ifft2c(ks)
+    imgs = ifft2c(ks)                              # 面内（最後の2軸）
+    if partition_3d:
+        imgs = ifftc_axis(imgs, part_axis)         # スライス(kz)方向も復元 → 3D IFFT
     multicoil = (kspace.ndim == 4)
 
     def to_mag(im):
@@ -230,8 +248,12 @@ def reconstruct(kspace: np.ndarray, recon_size=None, acq_matrix=None,
         imgs = imgs + rng.normal(0.0, sigma, imgs.shape) \
                     + 1j * rng.normal(0.0, sigma, imgs.shape)
 
-    mag = to_mag(imgs)
-    return center_crop(mag, recon_size)
+    mag = to_mag(imgs)                             # (partitions/slices, H, W)
+    mag = center_crop(mag, recon_size)             # 面内クロップ
+    if partition_3d and recon_z and 0 < recon_z < mag.shape[0]:
+        z0 = (mag.shape[0] - recon_z) // 2         # パーティション中央クロップ
+        mag = mag[z0:z0 + recon_z]
+    return mag
 
 
 # ----------------------------- ヘッダ解析 -----------------------------
@@ -266,6 +288,7 @@ def parse_header(raw) -> dict:
         "protocol": None, "sequence": None,
         "series_uid": None, "study_uid": None, "for_uid": None,
         "study_time": None,
+        "enc_z": None, "recon_z": None, "is_3d": False,
     }
     if raw is None:
         return meta
@@ -295,6 +318,20 @@ def parse_header(raw) -> dict:
     enc = _find(root, "encoding")
     meta["thickness"] = float(_ftext(enc, "sliceThickness", meta["thickness"]))
     meta["spacing"] = float(_ftext(enc, "spacingBetweenSlices", meta["spacing"]))
+
+    # 3D 取得の判定（パーティション方向 kz もエンコードされているか）
+    enc_sp = _find(enc, "encodedSpace")
+    enc_mat = _find(enc_sp, "matrixSize")
+    rec_mat = mat
+    ez = _ftext(enc_mat, "z") if enc_mat is not None else None
+    rz = _ftext(rec_mat, "z") if rec_mat is not None else None
+    meta["enc_z"] = int(ez) if ez else None
+    meta["recon_z"] = int(rz) if rz else None
+    # kspace_encoding_step_2（パーティション位相エンコード）の最大値も併用
+    step2 = _find(enc, "kspace_encoding_step_2")
+    s2max = _ftext(step2, "maximum") if step2 is not None else None
+    s2max = int(s2max) if s2max else 0
+    meta["is_3d"] = bool((meta["enc_z"] or 1) > 1 or s2max > 0)
 
     meta["patient_position"] = _ftext(root, "patientPosition", meta["patient_position"])
     fs = _ftext(root, "systemFieldStrength_T")
@@ -520,7 +557,7 @@ def save_binary(vol: np.ndarray, rescale_slope: float, data_max: float, meta: di
 def process_file(path: str, in_root: str, out_root: str, fmts: set,
                  acq_matrix=None, snr=None, rng=None,
                  flip_x="auto", flip_y="auto", reverse="auto",
-                 slab=1, slab_step=None) -> int:
+                 slab=1, slab_step=None, recon_3d="auto", part_axis=0) -> int:
     rel = os.path.relpath(path, in_root)
     base = os.path.splitext(rel)[0]            # 例 inter-scan_motion/2022061401_T101
 
@@ -535,8 +572,12 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
     meta = parse_header(raw_hdr)
     recon_size = (meta["rows"], meta["cols"]) if meta["rows"] and meta["cols"] else None
 
+    # 3D取得か（auto=ヘッダの encodedSpace.z / kspace_encoding_step_2 から判定）
+    is3d = meta["is_3d"] if recon_3d == "auto" else (recon_3d == "on")
+
     rss = reconstruct(ks, recon_size=recon_size, acq_matrix=acq_matrix,
-                      snr=snr, rng=rng)
+                      snr=snr, rng=rng, partition_3d=is3d,
+                      recon_z=meta.get("recon_z"), part_axis=part_axis)
 
     # 向き補正（patientPosition 由来。全形式に共通適用して一貫させる）
     fx, fy, rev = resolve_orient(meta, flip_x, flip_y, reverse)
@@ -581,7 +622,8 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
         save_binary(rss, rescale_slope, data_max, meta, os.path.basename(base),
                     pid, acq, os.path.join(out_root, base), orient_note=orient_note)
 
-    print(f"[ok] {rel}  ({acq}, {meta.get('patient_position') or '?'})  "
+    print(f"[ok] {rel}  ({acq}, {meta.get('patient_position') or '?'}"
+          f"{', 3D' if is3d else ''})  "
           f"{rss.shape[0]} slices {rss.shape[1]}x{rss.shape[2]}  "
           f"[{'+'.join(sorted(fmts))}]{lf}{lf_slab}  rev_slices={rev}")
 
@@ -613,6 +655,7 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
         "rescale_slope": rescale_slope,
         "stored_max": int(round(data_max / rescale_slope)),
         "formats": "+".join(sorted(fmts)),
+        "is_3d": is3d,
         "flip_x": fx, "flip_y": fy, "reverse_slices": rev,
         "slab": slab if slab and slab > 1 else "",
         "acq_matrix": f"{acq_matrix[0]}x{acq_matrix[1]}" if acq_matrix else "",
@@ -652,6 +695,12 @@ def main() -> None:
                     help="N枚の薄スライスを矩形プロファイルで合成し厚2Dスライス化（既定1=無し）")
     ap.add_argument("--slab-step", type=int, default=None,
                     help="スラブの送り（既定=--slab で非重複）")
+    # 真の3D取得の再構成（パーティション方向 kz にも IFFT）
+    ap.add_argument("--recon-3d", choices=["auto", "on", "off"], default="auto",
+                    help="3D取得の再構成。auto=ヘッダ(encodedSpace.z/step_2)で判定、"
+                         "on=強制3D(スライス方向もIFFT)、off=面内のみ(2Dマルチスライス)")
+    ap.add_argument("--part-axis", type=int, default=0,
+                    help="3D時のパーティション(kz)軸（既定0。kspace=(kz,coil,ky,kx)前提）")
     args = ap.parse_args()
 
     fmt_map = {
@@ -684,7 +733,8 @@ def main() -> None:
                                acq_matrix=acq_matrix, snr=args.lowfield_snr, rng=rng,
                                flip_x=args.flip_x, flip_y=args.flip_y,
                                reverse=args.reverse_slices,
-                               slab=args.slab, slab_step=args.slab_step)
+                               slab=args.slab, slab_step=args.slab_step,
+                               recon_3d=args.recon_3d, part_axis=args.part_axis)
             records.append(rec)
             n_slices += rec["n_slices"]
             n_files += 1

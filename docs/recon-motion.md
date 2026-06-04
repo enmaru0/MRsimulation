@@ -12,9 +12,10 @@ fastMRI 形式の k-space（`.h5`）を画像に再構成し、**PNG / DICOM / b
 |---|---|---|---|
 | **マルチコイル(brain)** | `(slices, coils, H, W)` complex64 | コイル RSS、出力=encoded サイズ | `reconstruction_rss`(正解) 同梱 |
 | **単コイル(knee)** | `(slices, H, W)` complex64 | `|IFFT|`、reconSpace へ中央クロップ | `mask` でアンダーサンプリング(ゼロ詰め再構成) |
+| **3D取得** | `(partitions, coils, H, W)` complex64 | **3D IFFT**（kz も復元）→RSS→reconSpace へクロップ | `encodedSpace.z`>1 / `kspace_encoding_step_2`>0 で自動判定 |
 
-両形式とも `ismrmrd_header`（FOV・厚・間隔・TR/TE/TI・FA・磁場強度・UID）と attrs
-（`acquisition`, `patient_id`, brain は `max`）を持つ。
+各形式とも `ismrmrd_header`（FOV・厚・間隔・TR/TE/TI・FA・磁場強度・UID、3D は encoded/recon の z）と
+attrs（`acquisition`, `patient_id`, brain は `max`）を持つ。
 
 ## 再構成アルゴリズム
 
@@ -37,6 +38,28 @@ mag   = |ifft2c(kspace)|       (single coil)
 
 > 補足: numpy の既定 `ifft2`（norm=`backward`, 1/N 正規化）だと振幅が √(H·W) 倍ずれる。
 > fastMRI と一致させるには **`norm="ortho"` が必須**。
+
+### 真の 3D 取得（パーティション方向も k空間エンコード）
+
+2Dマルチスライス（各スライス独立）と違い、**真の 3D 取得**ではスライス（パーティション=kz）方向も
+k空間エンコードされる。この場合は**面内だけでなく kz 方向にも IFFT**が必要（＝3D IFFT）。
+形状だけでは 2D と区別できないため、`ismrmrd_header` の **`encodedSpace.matrixSize.z`>1** または
+**`kspace_encoding_step_2.maximum`>0** で自動判定する（`--recon-3d auto`、既定）。
+
+```
+imgs = ifftc(ifft2c(kspace), axis=partition)       # kz も含めた 3D IFFT
+mag  = sqrt( Σ_c |imgs_c|² )                        # コイル RSS
+mag  = crop(mag, reconSpace.z)                      # パーティションのオーバーサンプル除去
+```
+
+- 既定の k空間レイアウトは **`(kz, coils, ky, kx)`**（軸0=パーティション）。異なる場合は
+  `--part-axis` で指定。
+- `--recon-3d on`/`off` で強制/無効化できる（auto が誤判定する形式向け）。
+- 合成3Dファントムのラウンドトリップで検証済み（相対誤差 ~1e-7）。2D 取得は自動で
+  従来どおり面内のみ IFFT（回帰確認済み）。
+
+> このリポジトリの既存データ（brain/gre/knee）はすべて 2D マルチスライス取得。3D データは
+> このPCには無いが、上記の自動判定＋3D IFFT で再構成できるよう実装・検証してある。
 
 ## 低磁場シミュレーション（再構成前・k空間ドメイン）
 
@@ -245,6 +268,8 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--reverse-slices` | `auto` | スライス方向反転 auto(=patientPosition由来)/on/off |
 | `--slab` | `1` | N枚を rect 合成して厚2Dスライス化（2Dシミュレーション） |
 | `--slab-step` | `=N` | スラブの送り（`<N` で重なり） |
+| `--recon-3d` | `auto` | 3D取得の再構成 auto(=ヘッダ判定)/on(強制3D)/off(面内のみ) |
+| `--part-axis` | `0` | 3D時のパーティション(kz)軸（`(kz,coil,ky,kx)`前提） |
 
 ## 注意
 
