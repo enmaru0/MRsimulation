@@ -6,6 +6,7 @@ MRI DICOM / k-space から物理的に整合したシミュレーション画像
 - **`calibrate.py`** — 実2D/3Dペアからスライスプロファイル等を実測較正・診断
 - **`lowfield_sim.py`** — 高磁場(1.5T/3T) → 低磁場(0.3-0.5T)風の劣化（ノイズ/解像度）
 - **`recon_motion.py`** — fastMRI 形式 k-space(`.h5`, マルチコイル/単コイル) → 画像再構成（PNG / DICOM / binary、低磁場シミュレーション付き）
+- **`dicom_to_raw.py`** — DICOMフォルダ階層を再帰探索 → 最下層ごとに 3D `.raw/.hdr` を出力＋DICOMタグを `summary_dicom_tag.csv` に集約
 
 例: 1mmスライス厚の3Dデータ → **5mm厚 / 6mm間隔**の2D画像を、MRIの原理に基づいて生成する。
 
@@ -25,6 +26,7 @@ MRI DICOM / k-space から物理的に整合したシミュレーション画像
 | [実ペアデータによる較正・検証](docs/calibration.md) | `calibrate.py` | SSP実測、フォワードモデル、面内較正、QA診断 |
 | [高磁場→低磁場シミュレーション](docs/lowfield.md) | `lowfield_sim.py` ほか | ノイズ/解像度劣化、低磁場プロファイル較正、手動ノイズ計測 |
 | [k-spaceからの再構成](docs/recon-motion.md) | `recon_motion.py` | マルチ/単コイル再構成、低磁場シミュレーション、PNG/DICOM/binary 出力 |
+| [DICOM → raw 一括変換](docs/dicom-to-raw.md) | `dicom_to_raw.py` | フォルダ階層の再帰探索、3D `.raw/.hdr` 出力、DICOMタグCSV集約 |
 
 > 図は `docs/images/` に置かれ、[`docs/make_figures.py`](docs/make_figures.py) が**合成ファントム**から
 > 再生成する（患者データ不使用。`pip install matplotlib` が必要）。

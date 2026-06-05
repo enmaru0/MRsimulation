@@ -27,6 +27,9 @@ knee_multicoil_test_2dsim_png/
 *.hdr
 *.tag
 summary.csv
+summary_dicom_tag.csv
+raw_out/
+Calgary-campinas/
 
 # Simulation outputs
 out_sim/
