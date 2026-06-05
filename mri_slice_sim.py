@@ -28,6 +28,13 @@ mri_slice_sim.py
   信号低下を過小評価しうる）。
 - 面内解像度は変更しない（through-plane のみ）。面内を変える場合はk空間
   トランケーション(Gibbsリンギング)が別途必要。
+
+出力形式（--format）
+-------------------
+- dicom（既定）: 2D厚スライスDICOM（ジオメトリ・新UID付き）
+- png          : 8bit グレースケール（out_dir/sl00.png ...）
+- binary       : int16 .raw + .hdr('X Y Z 2 dx dy dz') + .tag（recon_motion.py と同規約）
+- both=dicom+png / all=全部
 """
 from __future__ import annotations
 
@@ -398,6 +405,78 @@ def write_resliced(series: Series,
 
 
 # --------------------------------------------------------------------------- #
+# PNG / binary 出力（recon_motion.py と同じ規約: 8bit PNG / int16 .raw+.hdr+.tag）
+_STORE_MAX = 32000
+
+
+def _rescale_slope_for(data_max: float, lo: float = 1000.0,
+                       hi: float = float(_STORE_MAX)) -> float:
+    """実最大値から rescale_slope(10のべき乗)を決める。格納値が過大にならず
+    magnitude = 格納値 * rescale_slope で復元できるようにする。"""
+    if data_max <= 0:
+        return 1.0
+    gain = 1.0
+    while data_max * gain < lo:
+        gain *= 10.0
+    while data_max * gain > hi:
+        gain /= 10.0
+    return 1.0 / gain
+
+
+def save_png_volume(vol: np.ndarray, out_dir: str) -> None:
+    """厚スライスボリュームを 8bit グレースケール PNG 群で出力（ボリューム最大値で正規化）。"""
+    try:
+        from PIL import Image
+    except ImportError as e:  # noqa: BLE001
+        raise SystemExit("PNG出力には Pillow が必要です: pip install Pillow") from e
+    os.makedirs(out_dir, exist_ok=True)
+    vmax = float(np.max(vol))
+    v = np.clip(vol / (vmax + 1e-9), 0.0, 1.0)
+    u8 = (v * 255.0 + 0.5).astype(np.uint8)
+    for i in range(u8.shape[0]):
+        Image.fromarray(u8[i], mode="L").save(os.path.join(out_dir, f"sl{i:02d}.png"))
+
+
+def save_binary_volume(vol: np.ndarray, out_base: str, dx: float, dy: float, dz: float,
+                       thickness: float, tag_extra=None, flip_y: bool = True) -> None:
+    """厚スライスボリュームを 2byte .raw + .hdr + .tag で出力（recon_motion と同規約）。
+
+    .raw=int16 LE (x最速→y→z)、.hdr='X Y Z 2 dx dy dz'、.tag=各種情報。
+    格納値=round(magnitude/rescale_slope)。flip_y で行(上下)を反転（raw ビューア向け、既定ON）。
+    """
+    nz, ny, nx = vol.shape
+    data_max = float(np.max(vol))
+    slope = _rescale_slope_for(data_max)
+    stored = np.clip(np.round(vol / (slope + 1e-30)), 0, _STORE_MAX).astype("<i2")
+    if flip_y:
+        stored = stored[:, ::-1, :]
+    os.makedirs(os.path.dirname(out_base) or ".", exist_ok=True)
+    with open(out_base + ".raw", "wb") as f:
+        f.write(np.ascontiguousarray(stored).tobytes())
+    with open(out_base + ".hdr", "w") as f:
+        f.write(f"{nx} {ny} {nz} 2 {dx:g} {dy:g} {dz:g}")
+    lines = [
+        "source: mri_slice_sim.py (2D thick-slice simulation)",
+        f"dims_xyz: {nx} {ny} {nz}",
+        f"voxel_spacing_mm_xyz: {dx:g} {dy:g} {dz:g}",
+        f"slice_thickness_mm: {thickness:g}",
+        f"spacing_between_slices_mm: {dz:g}",
+        "data_type: int16",
+        "byte_order: little_endian",
+        "bytes_per_voxel: 2",
+        f"voxel_order: x_fastest_then_y_then_z{'  (y flipped)' if flip_y else ''}",
+        f"intensity_max: {data_max:g}",
+        f"stored_max: {int(np.max(stored))}",
+        f"rescale_slope: {slope:g}",
+        "rescale_note: magnitude = stored_value * rescale_slope",
+    ]
+    if tag_extra:
+        lines += [f"{k}: {v}" for k, v in tag_extra.items()]
+    with open(out_base + ".tag", "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------- #
 def simulate(in_dir: str,
              out_dir: str,
              thickness: float,
@@ -411,7 +490,10 @@ def simulate(in_dir: str,
              in_plane_spacing: float | None = None,
              recon_step: float | None = None,
              ssp_file: str | None = None,
-             in_plane_blur: float = 0.0) -> None:
+             in_plane_blur: float = 0.0,
+             fmts: set | None = None,
+             raw_flip_y: bool = True) -> None:
+    fmts = fmts or {"dicom"}
     series = load_series(in_dir, pattern)
     dz_in = float(np.median(np.diff(series.positions)))
     ps_in = [float(x) for x in series.template.PixelSpacing]
@@ -442,7 +524,9 @@ def simulate(in_dir: str,
         print(f"[sim ] native profile={profile_name} FWHM={thickness}mm "
               f"support={support}mm blur={in_plane_blur}mm "
               f"-> {centers.size} slices @ {spacing}mm spacing")
-        write_output(series, centers, out, thickness, spacing, out_dir, series_desc)
+        if "dicom" in fmts:
+            write_output(series, centers, out, thickness, spacing, out_dir, series_desc)
+        dy_out, dx_out = ps_in[0], ps_in[1]
     else:
         # AX/COR/SAG: 患者座標系でリスライスしてからプロファイル積分
         u, v, n = ORIENTATIONS[orientation]
@@ -458,9 +542,23 @@ def simulate(in_dir: str,
         print(f"[sim ] {orientation} profile={profile_name} FWHM={thickness}mm "
               f"support={support}mm blur={in_plane_blur}mm in-plane={ips:.3f}mm "
               f"recon-step={step:.3f}mm -> {centers.size} slices {R}x{C} @ {spacing}mm spacing")
-        write_resliced(series, u, v, n, a_min, b_min, ips,
-                       centers, out, thickness, spacing, out_dir, series_desc)
-    print(f"[save] {centers.size} files -> {out_dir}")
+        if "dicom" in fmts:
+            write_resliced(series, u, v, n, a_min, b_min, ips,
+                           centers, out, thickness, spacing, out_dir, series_desc)
+        dy_out = dx_out = ips
+
+    # PNG / binary 出力（共通。out=厚スライスボリューム、dz=出力スライス間隔）
+    if "png" in fmts:
+        save_png_volume(out, out_dir)
+    if "binary" in fmts:
+        base = os.path.join(out_dir, os.path.basename(os.path.normpath(out_dir)) or "volume")
+        save_binary_volume(out, base, dx_out, dy_out, spacing, thickness,
+                           tag_extra={"orientation": orientation, "profile": profile_name},
+                           flip_y=raw_flip_y)
+
+    n_made = centers.size
+    made = [f for f in ("dicom", "png", "binary") if f in fmts]
+    print(f"[save] {n_made} slices ({'+'.join(made)}) -> {out_dir}")
 
 
 def main() -> None:
@@ -490,12 +588,23 @@ def main() -> None:
                     help="calibrate.py が出力した実測SSP(.npy)。指定時は --profile/--thickness より優先")
     ap.add_argument("--in-plane-blur", type=float, default=0.0,
                     help="面内ガウシアンPSFのσ[mm]。calibrate --fit-inplane の sigma_mm を指定")
+    ap.add_argument("--format", choices=["dicom", "png", "binary", "both", "all"],
+                    default="dicom",
+                    help="出力形式（dicom/png/binary、both=dicom+png、all=全部。既定 dicom）")
+    ap.add_argument("--raw-no-flip-y", action="store_true",
+                    help="binary(.raw)出力で行(y)反転をしない（既定は反転）")
     args = ap.parse_args()
+
+    fmt_map = {
+        "dicom": {"dicom"}, "png": {"png"}, "binary": {"binary"},
+        "both": {"dicom", "png"}, "all": {"dicom", "png", "binary"},
+    }
 
     simulate(args.input, args.output, args.thickness, args.spacing,
              args.profile, args.support, args.start, args.pattern, args.desc,
              args.orientation, args.in_plane_spacing, args.recon_step, args.ssp_file,
-             args.in_plane_blur)
+             args.in_plane_blur, fmts=fmt_map[args.format],
+             raw_flip_y=not args.raw_no_flip_y)
 
 
 if __name__ == "__main__":

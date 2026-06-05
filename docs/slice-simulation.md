@@ -75,6 +75,31 @@ CTのガウシアン版との違いは次の2点だけ。
 | `--recon-step` | 入力最小 | リスライス時の法線方向の細刻み [mm] |
 | `--ssp-file` | — | `calibrate.py` の実測SSP(.npy)。`--profile`/`--thickness` より優先 |
 | `--in-plane-blur` | `0` | 面内ガウシアンPSFのσ[mm]（`calibrate --fit-inplane` の `sigma_mm`） |
+| `--format` | `dicom` | 出力形式 `dicom`/`png`/`binary`/`both`(=dicom+png)/`all` |
+| `--raw-no-flip-y` | off | binary(.raw)の行(y)反転をしない（既定は反転） |
+
+---
+
+## 出力形式（DICOM / PNG / binary）
+
+`--format` で出力形式を選べる（[`recon_motion.py`](recon-motion.md) と同規約）。
+
+| 値 | 出力 |
+|---|---|
+| `dicom`（既定） | 2D厚スライスDICOM（`*.DCM`、ジオメトリ・新UID付き） |
+| `png` | 8bit グレースケール `sl00.png …`（ボリューム最大値で正規化） |
+| `binary` | `<out_dir名>.raw`(int16 LE) + `.hdr`(`X Y Z 2 dx dy dz`) + `.tag` |
+| `both` | dicom + png |
+| `all` | dicom + png + binary |
+
+binary の `.hdr` の z は**出力スライス間隔**、`.tag` に `slice_thickness_mm` と
+`rescale_slope`（`magnitude = stored * rescale_slope`）を記録。すべて `out_dir` 直下に出る。
+
+```bash
+# 5mm厚/6mm間隔・軸位を PNG と binary でも出力
+.venv/bin/python mri_slice_sim.py cc_dicom/<basename> out_ax \
+    --thickness 5 --spacing 6 --orientation axial --pattern "*.dcm" --format all
+```
 
 ---
 
