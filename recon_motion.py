@@ -125,14 +125,17 @@ def resolve_orient(meta: dict, flip_x="auto", flip_y="auto", reverse="auto"):
     簡易 fastMRI 形式にはスライス毎の ImageOrientationPatient/ImagePositionPatient が
     無く、参照できる向き情報は `patientPosition`(HFS/FFS 等)のみ。これでスライス積層方向と
     左右を一貫させる（HFS と FFS で S-I / L-R が反転するため）。auto 時の既定:
-      - flip_y       : True（行=上下を合わせる。撮像面に依らず supine なら anterior が上）
-      - reverse_slices: Head-First なら True / Feet-First なら False（積層方向を合わせる）
-      - flip_x       : False（左右はそのまま。必要なら on で反転）
+      - patientPosition あり: flip_y=True、reverse_slices=Head-First?True:False、flip_x=False
+      - patientPosition 無し（ヘッダ無し。Calgary-Campinas 等）: いずれも False
+        （向き情報が無いので素の配列順を尊重し、勝手な反転をしない）
     on/off で明示上書きできる。
     """
-    pos = (meta.get("patient_position") or "HFS").upper()
-    head_first = pos.startswith("HF")
-    auto = {"flip_x": False, "flip_y": True, "reverse_slices": head_first}
+    pos = meta.get("patient_position")
+    if pos:
+        head_first = pos.upper().startswith("HF")
+        auto = {"flip_x": False, "flip_y": True, "reverse_slices": head_first}
+    else:
+        auto = {"flip_x": False, "flip_y": False, "reverse_slices": False}
 
     def pick(opt, key):
         return auto[key] if opt == "auto" else (opt == "on")
@@ -338,7 +341,7 @@ def parse_header(raw) -> dict:
     meta = {
         "rows": None, "cols": None, "dx": None, "dy": None,
         "thickness": 5.0, "spacing": 6.0,
-        "patient_position": "HFS", "field_strength": None,
+        "patient_position": None, "field_strength": None,
         "tr": None, "te": None, "ti": None, "flip": None,
         "vendor": None, "model": None, "institution": None,
         "protocol": None, "sequence": None,
@@ -618,7 +621,8 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
                  acq_matrix=None, snr=None, rng=None,
                  flip_x="auto", flip_y="auto", reverse="auto",
                  slab=1, slab_step=None, recon_3d="auto", part_axis=0,
-                 transpose=None, real_imag_axis=None, kspace_dc="center") -> int:
+                 transpose=None, real_imag_axis=None, kspace_dc="center",
+                 pixel_spacing=None, slice_spacing=None, slice_thickness=None) -> int:
     rel = os.path.relpath(path, in_root)
     base = os.path.splitext(rel)[0]            # 例 inter-scan_motion/2022061401_T101
 
@@ -632,6 +636,14 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
     # ヘッダは常に解析（recon サイズ＝reconSpace への中央クロップに必要。単コイル膝など）
     meta = parse_header(raw_hdr)
     recon_size = (meta["rows"], meta["cols"]) if meta["rows"] and meta["cols"] else None
+
+    # ジオメトリの明示上書き（ヘッダ無しデータ＝Calgary-Campinas 等の voxel 間隔指定）
+    if pixel_spacing is not None:
+        meta["dy"], meta["dx"] = pixel_spacing            # [row, col] mm
+    if slice_spacing is not None:
+        meta["spacing"] = slice_spacing
+    if slice_thickness is not None:
+        meta["thickness"] = slice_thickness
 
     # 3D取得か（auto=ヘッダの encodedSpace.z / kspace_encoding_step_2 から判定）
     is3d = meta["is_3d"] if recon_3d == "auto" else (recon_3d == "on")
@@ -790,6 +802,13 @@ def main() -> None:
                     help="k空間のDC位置。center=中心(fastMRI規約,既定)、"
                          "corner=端[0,0](標準FFT配置/Calgary-Campinas)。"
                          "corner を center で再構成すると像が四隅に分裂する")
+    # ジオメトリの上書き（ヘッダ無しデータ用。例 Calgary-Campinas は 1mm 等方）
+    ap.add_argument("--pixel-spacing", default=None,
+                    help="面内画素間隔[mm]を上書き。'v'(等方) か 'row,col'。例 1 / 0.9,0.9")
+    ap.add_argument("--slice-spacing", type=float, default=None,
+                    help="スライス間隔(SpacingBetweenSlices)[mm]を上書き。例 1")
+    ap.add_argument("--slice-thickness", type=float, default=None,
+                    help="スライス厚(SliceThickness)[mm]を上書き。例 1")
     args = ap.parse_args()
 
     fmt_map = {
@@ -804,6 +823,10 @@ def main() -> None:
         acq_matrix = (parts[0], parts[0]) if len(parts) == 1 else (parts[0], parts[1])
     rng = np.random.default_rng(args.seed) if args.lowfield_snr else None
     transpose = tuple(int(v) for v in args.transpose.split(",")) if args.transpose else None
+    pixel_spacing = None
+    if args.pixel_spacing:
+        pv = [float(v) for v in str(args.pixel_spacing).split(",")]
+        pixel_spacing = (pv[0], pv[0]) if len(pv) == 1 else (pv[0], pv[1])   # (row, col)
 
     files = sorted(glob.glob(os.path.join(args.in_root, "**", "*.h5"), recursive=True))
     if args.limit:
@@ -826,7 +849,9 @@ def main() -> None:
                                slab=args.slab, slab_step=args.slab_step,
                                recon_3d=args.recon_3d, part_axis=args.part_axis,
                                transpose=transpose, real_imag_axis=args.real_imag_axis,
-                               kspace_dc=args.kspace_dc)
+                               kspace_dc=args.kspace_dc, pixel_spacing=pixel_spacing,
+                               slice_spacing=args.slice_spacing,
+                               slice_thickness=args.slice_thickness)
             records.append(rec)
             n_slices += rec["n_slices"]
             n_files += 1

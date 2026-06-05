@@ -82,14 +82,29 @@ python recon_motion.py --in-root <dir> --out-root out --transpose 2,3,0,1
 # inspect で形式を確認（CC形式なら推奨コマンドも表示）
 python inspect_h5.py Calgary-campinas/test
 
-# 複素化(24→12coil) → (slice,coil,ky,kx) → 端DCの2D再構成
+# 複素化(24→12coil) → (slice,coil,ky,kx) → 端DCの2D再構成 + voxel間隔指定
 python recon_motion.py --in-root Calgary-campinas/test --out-root cc_out \
-    --real-imag-axis -1 --transpose 0,3,1,2 --kspace-dc corner --format png
+    --real-imag-axis -1 --transpose 0,3,1,2 --kspace-dc corner \
+    --pixel-spacing 1 --slice-spacing 1 --slice-thickness 1 --format png
 ```
 
 `--real-imag-axis` は `--transpose` より先に適用される（複素化後の軸番号で transpose を指定）。
 合成CCデータのラウンドトリップで検証済み（相対誤差 ~1e-7）。
 もし第1軸が画像領域でなく k空間（真の3D）なら `--recon-3d on --part-axis 0` を追加して比較する。
+
+#### ヘッダ無しデータの向き・ジオメトリ
+
+`ismrmrd_header` が無いデータ（Calgary-Campinas 等）では:
+
+- **向き補正は既定で「なし」**（`patientPosition` 不明のため、flip_y/flip_x/reverse_slices すべて
+  False ＝ 素の配列順）。上下/スライスが逆なら `--flip-y on` / `--reverse-slices on` / `--flip-x on`
+  で個別に合わせる。
+- **voxel 間隔はヘッダから取れない**ので `--pixel-spacing`（面内, `v` か `row,col`）・
+  `--slice-spacing`（スライス間隔）・`--slice-thickness`（スライス厚）で明示する
+  （未指定だと既定 thickness=5 / spacing=6 のままになり不正確）。CC は概ね 1mm 等方。
+
+> fastMRI データ（brain/knee/gre/motion）は `patientPosition` を持つので従来どおり自動補正
+> （回帰確認済み）。
 
 #### k空間の DC 位置（`--kspace-dc`）
 
@@ -320,6 +335,9 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--transpose` | — | k空間の軸並べ替え permutation（例 `2,3,0,1`） |
 | `--real-imag-axis` | — | 実/虚インターリーブ軸を複素化（Calgary-Campinas は `-1`） |
 | `--kspace-dc` | `center` | DC位置 center(fastMRI)/corner(Calgary-Campinas等) |
+| `--pixel-spacing` | — | 面内画素間隔[mm]上書き（`v` か `row,col`）。ヘッダ無し用 |
+| `--slice-spacing` | — | スライス間隔[mm]上書き。ヘッダ無し用 |
+| `--slice-thickness` | — | スライス厚[mm]上書き。ヘッダ無し用 |
 
 ## 注意
 
