@@ -117,9 +117,10 @@ def inspect(path: str) -> None:
               f"coil×2={shape[-1]}→{ncoil}coil)。第1軸は既に画像領域（CCチャレンジ規約）。")
         print("     コマンド例:")
         print("       python recon_motion.py --in-root <dir> --out-root cc_out \\")
-        print("           --real-imag-axis -1 --transpose 0,3,1,2 --format png")
-        print("       # 複素化(24->12coil) → (slice,coil,ky,kx) へ並べ替え → 2D再構成")
-        print("     ※ スライス方向(第1軸)がもしk空間なら --recon-3d on を追加して比較。")
+        print("           --real-imag-axis -1 --transpose 0,3,1,2 --kspace-dc corner --format png")
+        print("       # 複素化(24->12coil) → (slice,coil,ky,kx) → 端DCの2D再構成")
+        print("     ※ CC は DC が端[0,0]（標準FFT配置）。--kspace-dc corner を付けないと")
+        print("        像が四隅に分裂する。スライス方向がk空間なら --recon-3d on も比較。")
     else:
         print("  recon_motion は標準レイアウト (kz, coil, ky, kx) = 軸(0,1,2,3) を想定。")
         print("  上の推定で kx/ky が最後の2軸、partition(kz) が軸0 になっていない場合は、")

@@ -257,7 +257,7 @@ def detect_layout(shape, enc_x, enc_y, enc_z):
 def reconstruct(kspace: np.ndarray, recon_size=None, acq_matrix=None,
                 snr: float | None = None, rng=None,
                 partition_3d: bool = False, recon_z=None,
-                part_axis: int = 0) -> np.ndarray:
+                part_axis: int = 0, centered_kspace: bool = True) -> np.ndarray:
     """k空間 → magnitude 画像。マルチコイル(...,C,H,W)はRSS、単コイル(...,H,W)は|.|。
 
     既定は面内(最後の2軸)のみ IFFT（2Dマルチスライス）。
@@ -265,8 +265,12 @@ def reconstruct(kspace: np.ndarray, recon_size=None, acq_matrix=None,
     1D 逆FFT を掛ける＝スライス方向も k空間エンコードを復元する。recon_z 指定時は
     パーティション軸をその枚数へ中央クロップ（スライスオーバーサンプリング除去）。
 
+    centered_kspace: True=DCが中心（fastMRI規約。ifftshift/fftshift 付き）。
+      False=DCが端[0,0]（標準FFT配置、Calgary-Campinas 等）→ シフト無しの素の ifft。
+      端DCに中心化IFFTを使うと像が半周ずれ「四隅に分裂」するため要切替。
+
     低磁場シミュレーション（任意・k空間ドメイン、出力画素数は不変）:
-    - acq_matrix=(tr,tc): 取得マトリクスを中央クロップで落とす（解像度低下）
+    - acq_matrix=(tr,tc): 取得マトリクスを中央クロップで落とす（中心DC前提）
     - snr: 複素ガウシアンノイズを付加して目標SNRへ（RSS後 Rician/noncentral-chi）
     recon_size=(rows,cols): IFFT後に中央クロップ（fastMRI reconSpace。Noneで無し）
     """
@@ -274,9 +278,14 @@ def reconstruct(kspace: np.ndarray, recon_size=None, acq_matrix=None,
     if acq_matrix is not None:
         ks = kspace_crop_zerofill(ks, acq_matrix)
 
-    imgs = ifft2c(ks)                              # 面内（最後の2軸）
-    if partition_3d:
-        imgs = ifftc_axis(imgs, part_axis)         # スライス(kz)方向も復元 → 3D IFFT
+    if centered_kspace:
+        imgs = ifft2c(ks)                          # 面内（中心DC）
+        if partition_3d:
+            imgs = ifftc_axis(imgs, part_axis)     # スライス(kz)方向も復元 → 3D IFFT
+    else:                                          # 端DC: シフト無しの素の ifft
+        imgs = np.fft.ifft2(ks, axes=(-2, -1), norm="ortho")
+        if partition_3d:
+            imgs = np.fft.ifft(imgs, axis=part_axis, norm="ortho")
     multicoil = (kspace.ndim == 4)
 
     def to_mag(im):
@@ -609,7 +618,7 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
                  acq_matrix=None, snr=None, rng=None,
                  flip_x="auto", flip_y="auto", reverse="auto",
                  slab=1, slab_step=None, recon_3d="auto", part_axis=0,
-                 transpose=None, real_imag_axis=None) -> int:
+                 transpose=None, real_imag_axis=None, kspace_dc="center") -> int:
     rel = os.path.relpath(path, in_root)
     base = os.path.splitext(rel)[0]            # 例 inter-scan_motion/2022061401_T101
 
@@ -645,7 +654,8 @@ def process_file(path: str, in_root: str, out_root: str, fmts: set,
 
     rss = reconstruct(ks, recon_size=recon_size, acq_matrix=acq_matrix,
                       snr=snr, rng=rng, partition_3d=is3d,
-                      recon_z=meta.get("recon_z"), part_axis=part_axis)
+                      recon_z=meta.get("recon_z"), part_axis=part_axis,
+                      centered_kspace=(kspace_dc == "center"))
 
     # 向き補正（patientPosition 由来。全形式に共通適用して一貫させる）
     fx, fy, rev = resolve_orient(meta, flip_x, flip_y, reverse)
@@ -776,6 +786,10 @@ def main() -> None:
     ap.add_argument("--real-imag-axis", type=int, default=None,
                     help="実/虚インターリーブ軸（実数格納の複素データ）。その軸 2N→N に複素化。"
                          "Calgary-Campinas は最後の軸（例 -1）。--transpose より先に適用")
+    ap.add_argument("--kspace-dc", choices=["center", "corner"], default="center",
+                    help="k空間のDC位置。center=中心(fastMRI規約,既定)、"
+                         "corner=端[0,0](標準FFT配置/Calgary-Campinas)。"
+                         "corner を center で再構成すると像が四隅に分裂する")
     args = ap.parse_args()
 
     fmt_map = {
@@ -811,7 +825,8 @@ def main() -> None:
                                reverse=args.reverse_slices,
                                slab=args.slab, slab_step=args.slab_step,
                                recon_3d=args.recon_3d, part_axis=args.part_axis,
-                               transpose=transpose, real_imag_axis=args.real_imag_axis)
+                               transpose=transpose, real_imag_axis=args.real_imag_axis,
+                               kspace_dc=args.kspace_dc)
             records.append(rec)
             n_slices += rec["n_slices"]
             n_files += 1

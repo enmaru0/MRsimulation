@@ -82,14 +82,28 @@ python recon_motion.py --in-root <dir> --out-root out --transpose 2,3,0,1
 # inspect で形式を確認（CC形式なら推奨コマンドも表示）
 python inspect_h5.py Calgary-campinas/test
 
-# 複素化(24→12coil) → (slice,coil,ky,kx) へ並べ替え → 2D再構成
+# 複素化(24→12coil) → (slice,coil,ky,kx) → 端DCの2D再構成
 python recon_motion.py --in-root Calgary-campinas/test --out-root cc_out \
-    --real-imag-axis -1 --transpose 0,3,1,2 --format png
+    --real-imag-axis -1 --transpose 0,3,1,2 --kspace-dc corner --format png
 ```
 
 `--real-imag-axis` は `--transpose` より先に適用される（複素化後の軸番号で transpose を指定）。
 合成CCデータのラウンドトリップで検証済み（相対誤差 ~1e-7）。
 もし第1軸が画像領域でなく k空間（真の3D）なら `--recon-3d on --part-axis 0` を追加して比較する。
+
+#### k空間の DC 位置（`--kspace-dc`）
+
+本ツールの既定は **DC が中心**（fastMRI 規約、`ifftshift/fftshift` 付き IFFT）。
+**Calgary-Campinas は DC が端 `[0,0]`**（標準 FFT 配置）なので、`--kspace-dc corner`
+（シフト無しの素の `ifft`）が必要。これを付けないと像が半周ずれて **脳が四隅に分裂**する。
+
+| `--kspace-dc` | IFFT | 対象 |
+|---|---|---|
+| `center`（既定） | `fftshift(ifft2(ifftshift(k)))` | fastMRI（brain/knee/gre/motion 等、DC中心） |
+| `corner` | `ifft2(k)`（シフト無し） | Calgary-Campinas 等、DC が端の標準FFT配置 |
+
+> 中心DC前提と端DC前提は**1回のシフトでは相互変換できない**（半画素変調の差）ため、
+> 経路自体を切り替える。合成データで四隅問題の再現と `corner` での修正を確認済み。
 
 > このリポジトリの既存データ（brain/gre/knee）はすべて 2D マルチスライス取得。3D データは
 > このPCには無いが、上記の自動判定＋3D IFFT で再構成できるよう実装・検証してある。
@@ -303,6 +317,9 @@ python recon_motion.py --in-root motion --out-root out_check --format all --limi
 | `--slab-step` | `=N` | スラブの送り（`<N` で重なり） |
 | `--recon-3d` | `auto` | 3D取得の再構成 auto(=ヘッダ判定)/on(強制3D)/off(面内のみ) |
 | `--part-axis` | `0` | 3D時のパーティション(kz)軸（`(kz,coil,ky,kx)`前提） |
+| `--transpose` | — | k空間の軸並べ替え permutation（例 `2,3,0,1`） |
+| `--real-imag-axis` | — | 実/虚インターリーブ軸を複素化（Calgary-Campinas は `-1`） |
+| `--kspace-dc` | `center` | DC位置 center(fastMRI)/corner(Calgary-Campinas等) |
 
 ## 注意
 
