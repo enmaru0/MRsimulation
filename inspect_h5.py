@@ -66,6 +66,12 @@ def inspect(path: str) -> None:
         for k, v in h.attrs.items():
             print(f"  attr {k} = {v}")
         hdr = _hdr_text(h)
+        # サンプリング密度の診断（代表スライス1枚）→ アンダーサンプリング(R)の検出
+        mid = tuple([shape[0] // 2] + [slice(None)] * (len(shape) - 1))
+        try:
+            sl = np.abs(np.asarray(ks[mid], dtype=np.float64))
+        except Exception:  # noqa: BLE001
+            sl = None
 
     enc = _space(hdr, "encodedSpace") or {}
     rec = _space(hdr, "reconSpace") or {}
@@ -81,6 +87,26 @@ def inspect(path: str) -> None:
     print(f"  patientPosition = {pos.group(1) if pos else '?'}")
     is3d = bool((enc.get("mz") or 1) > 1 or (s2 or 0) > 0)
     print(f"  => 3D 取得か: {is3d}")
+
+    # --- アンダーサンプリング(R)の検出 ---
+    if sl is not None and sl.size:
+        print("サンプリング密度（代表スライスの各軸、エネルギーのある面の割合）:")
+        thr = sl.max() * 1e-6
+        under = False
+        for ax in range(sl.ndim):
+            others = tuple(i for i in range(sl.ndim) if i != ax)
+            e = sl.sum(axis=others)
+            frac = float((e > thr).sum()) / len(e)
+            note = ""
+            if frac < 0.95:
+                note = f"  ← 間引きあり！ 加速 R≈{1.0/max(frac,1e-9):.1f}（この軸が位相エンコード）"
+                under = True
+            print(f"  axis {ax} (size={len(e)}): サンプル率={frac*100:.0f}%{note}")
+        if under:
+            print("  => アンダーサンプリング・データ（Test-R=N）。ゼロ詰めIFFTは原理的にボケる。")
+            print("     鮮明な像にはフルサンプリング(Train/Val)か、PI/CS/DL再構成が必要。")
+        else:
+            print("  => フルサンプリングのよう（ボケる場合は解像度/補間の問題を別途確認）。")
 
     # --- 各軸の役割推定（サイズ突き合わせ） ---
     ex, ey, ez = enc.get("mx"), enc.get("my"), enc.get("mz")

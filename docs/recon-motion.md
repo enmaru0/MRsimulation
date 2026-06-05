@@ -106,6 +106,19 @@ python recon_motion.py --in-root Calgary-campinas/test --out-root cc_out \
 > fastMRI データ（brain/knee/gre/motion）は `patientPosition` を持つので従来どおり自動補正
 > （回帰確認済み）。
 
+#### アンダーサンプリング（`Test-R=5` / `Test-R=10`）でボケる件
+
+Calgary-Campinas の `Test-R=5` / `Test-R=10` は **R 倍アンダーサンプリング**（k空間を 1/5・1/10
+だけ取得し残りは0）された**チャレンジ用の劣化データ**。`recon_motion.py` の**ゼロ詰めIFFT**で
+再構成すると、高周波が欠落して**原理的に強くボケる**（R=10 ほど顕著）。これはバグではなく、
+「この劣化を再構成アルゴリズムでどこまで復元できるか」を競うための入力。
+
+- **鮮明な像が欲しい** → **フルサンプリングの Train / Val** を使う。
+- **R=N データを鮮明化** → パラレルイメージング(SENSE/GRAPPA)・圧縮センシング・深層学習など
+  の**再構成アルゴリズム**が必要（本ツールのゼロ詰めはベースライン）。
+- アンダーサンプリングの有無は `inspect_h5.py` の「サンプリング密度」で確認できる
+  （位相エンコード軸のサンプル率が 100% 未満なら間引きあり＝Rを表示）。
+
 #### k空間の DC 位置（`--kspace-dc`）
 
 本ツールの既定は **DC が中心**（fastMRI 規約、`ifftshift/fftshift` 付き IFFT）。
