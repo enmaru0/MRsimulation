@@ -65,6 +65,8 @@ CONDITION_ORDER = [
 
 DIMENSION_ORDER = ["2D", "3D", "Unknown"]
 
+DEFAULT_EXCLUDE_SLICE_MM = 10.0
+
 COLUMN_ALIASES = {
     "series_description": [
         "SeriesDescription",
@@ -121,6 +123,41 @@ COLUMN_ALIASES = {
         "(0008,0008)",
         "0008,0008",
         "00080008",
+    ],
+    "frame_type": [
+        "FrameType",
+        "Frame Type",
+        "(0008,9007)",
+        "0008,9007",
+        "00089007",
+    ],
+    "complex_image_component": [
+        "ComplexImageComponent",
+        "Complex Image Component",
+        "(0008,9208)",
+        "0008,9208",
+        "00089208",
+    ],
+    "acquisition_contrast": [
+        "AcquisitionContrast",
+        "Acquisition Contrast",
+        "(0008,9209)",
+        "0008,9209",
+        "00089209",
+    ],
+    "derivation_description": [
+        "DerivationDescription",
+        "Derivation Description",
+        "(0008,2111)",
+        "0008,2111",
+        "00082111",
+    ],
+    "image_comments": [
+        "ImageComments",
+        "Image Comments",
+        "(0020,4000)",
+        "0020,4000",
+        "00204000",
     ],
     "slice_thickness": [
         "SliceThickness",
@@ -183,6 +220,64 @@ COLUMN_ALIASES = {
         "0018,1314",
         "00181314",
     ],
+    "echo_train_length": [
+        "EchoTrainLength",
+        "Echo Train Length",
+        "ETL",
+        "TurboFactor",
+        "Turbo Factor",
+        "(0018,0091)",
+        "0018,0091",
+        "00180091",
+    ],
+    "echo_numbers": [
+        "EchoNumbers",
+        "Echo Numbers",
+        "EchoNumber",
+        "Echo Number",
+        "(0018,0086)",
+        "0018,0086",
+        "00180086",
+    ],
+    "diffusion_b_value": [
+        "DiffusionBValue",
+        "Diffusion B Value",
+        "Diffusion b-value",
+        "BValue",
+        "B Value",
+        "B-value",
+        "(0018,9087)",
+        "0018,9087",
+        "00189087",
+    ],
+    "diffusion_directionality": [
+        "DiffusionDirectionality",
+        "Diffusion Directionality",
+        "(0018,9075)",
+        "0018,9075",
+        "00189075",
+    ],
+    "diffusion_anisotropy_type": [
+        "DiffusionAnisotropyType",
+        "Diffusion Anisotropy Type",
+        "(0018,9147)",
+        "0018,9147",
+        "00189147",
+    ],
+    "diffusion_gradient_orientation": [
+        "DiffusionGradientOrientation",
+        "Diffusion Gradient Orientation",
+        "(0018,9089)",
+        "0018,9089",
+        "00189089",
+    ],
+    "contrast_bolus_agent": [
+        "ContrastBolusAgent",
+        "Contrast Bolus Agent",
+        "(0018,0010)",
+        "0018,0010",
+        "00180010",
+    ],
     "number_of_slices": [
         "NumberOfSlices",
         "Number of Slices",
@@ -219,17 +314,30 @@ COLUMN_ALIASES = {
     ],
 }
 
-TEXT_KEYS = [
+SERIES_PROTOCOL_TEXT_KEYS = [
     "series_description",
     "protocol_name",
+]
+
+CLASSIFICATION_TEXT_KEYS = [
     "sequence_name",
     "scanning_sequence",
     "sequence_variant",
     "scan_options",
     "mr_acquisition_type",
     "image_type",
+    "frame_type",
+    "complex_image_component",
+    "acquisition_contrast",
+    "derivation_description",
+    "image_comments",
+    "diffusion_directionality",
+    "diffusion_anisotropy_type",
+    "contrast_bolus_agent",
     "body_part",
 ]
+
+TEXT_KEYS = SERIES_PROTOCOL_TEXT_KEYS + CLASSIFICATION_TEXT_KEYS
 
 NUMERIC_METRICS = [
     "slice_thickness_mm",
@@ -244,6 +352,9 @@ NUMERIC_METRICS = [
     "echo_time_ms",
     "inversion_time_ms",
     "flip_angle_deg",
+    "echo_train_length",
+    "echo_numbers",
+    "diffusion_b_value",
     "field_strength_t",
     "fov_row_mm",
     "fov_col_mm",
@@ -256,6 +367,8 @@ PLOT_METRICS = [
     ("slice_gap_mm", "Slice gap (mm)"),
     ("pixel_spacing_row_mm", "Pixel spacing row (mm)"),
     ("pixel_spacing_col_mm", "Pixel spacing col (mm)"),
+    ("fov_row_mm", "FOV row (mm)"),
+    ("fov_col_mm", "FOV col (mm)"),
     ("matrix_rows", "Matrix rows"),
     ("matrix_columns", "Matrix columns"),
     ("number_of_slices", "Number of slices"),
@@ -263,6 +376,22 @@ PLOT_METRICS = [
     ("echo_time_ms", "TE (ms)"),
     ("inversion_time_ms", "TI (ms)"),
     ("flip_angle_deg", "Flip angle (deg)"),
+]
+
+SUMMARY_METRICS = [
+    ("slice_thickness_mm", "slice_thickness_mm"),
+    ("slice_spacing_mm", "space_between_slices_mm"),
+    ("slice_gap_mm", "slice_gap_mm"),
+    ("pixel_spacing_row_mm", "pixel_spacing_row_mm"),
+    ("pixel_spacing_col_mm", "pixel_spacing_col_mm"),
+    ("fov_row_mm", "fov_row_mm"),
+    ("fov_col_mm", "fov_col_mm"),
+    ("matrix_rows", "matrix_rows"),
+    ("matrix_columns", "matrix_columns"),
+    ("number_of_slices", "number_of_slices"),
+    ("repetition_time_ms", "tr_ms"),
+    ("echo_time_ms", "te_ms"),
+    ("inversion_time_ms", "ti_ms"),
 ]
 
 
@@ -358,9 +487,13 @@ def get_cell(row: pd.Series, columns: dict[str, str | None], key: str) -> str:
     return clean_text(row.get(column, ""))
 
 
-def build_search_text(row: pd.Series, columns: dict[str, str | None]) -> str:
+def build_search_text(
+    row: pd.Series,
+    columns: dict[str, str | None],
+    keys: Iterable[str] | None = None,
+) -> str:
     parts = []
-    for key in TEXT_KEYS:
+    for key in keys or TEXT_KEYS:
         value = get_cell(row, columns, key)
         if value:
             parts.append(value)
@@ -402,7 +535,11 @@ def classify_condition(text: str) -> tuple[str, str]:
                 "tof",
                 "timeofflight",
                 "phasecontrastangio",
+                "phasecontrast",
                 "pcangio",
+                "pcmr",
+                "flowencoded",
+                "flowencoding",
                 "cetra",
                 "tricks",
                 "twist",
@@ -416,7 +553,10 @@ def classify_condition(text: str) -> tuple[str, str]:
 
     if (
         has_word(spaced, ["dwi", "diffusion", "trace"])
-        or has_compact(compact, ["dwi", "diffusion", "b1000", "b800", "b0"])
+        or has_compact(
+            compact,
+            ["dwi", "diffusion", "diffusionweighted", "traceweighted", "b1000", "b800", "b0"],
+        )
     ):
         return "DWI", "matched DWI/diffusion"
 
@@ -430,7 +570,16 @@ def classify_condition(text: str) -> tuple[str, str]:
         or has_word(spaced, ["swi", "swan", "t2star", "t2s", "hemo", "hemosiderin"])
         or has_compact(
             compact,
-            ["t2star", "t2s", "t2gre", "swi", "swan", "susceptibilityweighted"],
+            [
+                "t2star",
+                "t2s",
+                "t2gre",
+                "t2wgre",
+                "swi",
+                "swan",
+                "susceptibilityweighted",
+                "t2starweighted",
+            ],
         )
     ):
         return "T2star/SWI", "matched T2star/SWI"
@@ -461,6 +610,164 @@ def classify_condition(text: str) -> tuple[str, str]:
         return "T1", "matched T1/MPRAGE/SPGR"
 
     return "Other", "no rule matched"
+
+
+def get_number(row: pd.Series, columns: dict[str, str | None], key: str) -> float:
+    return first_number(get_cell(row, columns, key))
+
+
+def is_finite(value: float) -> bool:
+    return bool(np.isfinite(value))
+
+
+def metric_evidence(**values: float) -> str:
+    parts = []
+    for name, value in values.items():
+        if is_finite(value):
+            parts.append(f"{name}={value:g}")
+    return ", ".join(parts)
+
+
+def classify_condition_by_parameters(
+    row: pd.Series,
+    columns: dict[str, str | None],
+) -> tuple[str, str]:
+    """Fallback classifier that avoids SeriesDescription and ProtocolName.
+
+    This uses numeric MR parameters and non-protocol DICOM tags. It intentionally
+    stays conservative for MRA because short-TR/short-TE GRE can also be T1.
+    """
+
+    tr = get_number(row, columns, "repetition_time")
+    te = get_number(row, columns, "echo_time")
+    ti = get_number(row, columns, "inversion_time")
+    fa = get_number(row, columns, "flip_angle")
+    etl = get_number(row, columns, "echo_train_length")
+    echo_numbers = get_number(row, columns, "echo_numbers")
+    b_value = get_number(row, columns, "diffusion_b_value")
+    thickness = get_number(row, columns, "slice_thickness")
+
+    tag_text = build_search_text(row, columns, CLASSIFICATION_TEXT_KEYS)
+    spaced, compact = text_forms(tag_text)
+
+    has_diffusion_tag = any(
+        get_cell(row, columns, key)
+        for key in [
+            "diffusion_directionality",
+            "diffusion_anisotropy_type",
+            "diffusion_gradient_orientation",
+        ]
+    )
+    if is_finite(b_value) and (b_value > 0 or has_diffusion_tag):
+        return (
+            "DWI",
+            "parameter heuristic: diffusion b-value/tag present; "
+            + metric_evidence(b=b_value, TR=tr, TE=te),
+        )
+
+    has_gr = (
+        has_word(spaced, ["gr", "gre", "spgr", "fspgr", "tfe", "ffe"])
+        or has_compact(compact, ["gradient", "gradientecho", "spoiledgre", "fastspgr"])
+    )
+    has_se = has_word(spaced, ["se", "tse", "fse", "ir"]) or has_compact(
+        compact, ["spinecho", "turbospinecho", "fastspinecho", "inversionrecovery"]
+    )
+    has_ep = has_word(spaced, ["ep", "epi"]) or has_compact(compact, ["echoplanar"])
+    has_ir = has_word(spaced, ["ir"]) or has_compact(compact, ["inversionrecovery"])
+    has_phase = has_word(spaced, ["phase"]) or has_compact(compact, ["phaseimage"])
+    has_magnitude = has_word(spaced, ["magnitude", "mag"]) or has_compact(
+        compact, ["magnitudeimage"]
+    )
+
+    if has_ep and is_finite(te) and te >= 45 and (is_finite(tr) and tr >= 1000):
+        return (
+            "DWI",
+            "parameter heuristic: EPI with long TE/TR, review if this could be fMRI/perfusion; "
+            + metric_evidence(TR=tr, TE=te, b=b_value),
+        )
+
+    if is_finite(ti) and ti >= 1400 and (
+        (is_finite(tr) and tr >= 4000) or (is_finite(te) and te >= 60)
+    ):
+        return (
+            "FLAIR",
+            "parameter heuristic: long inversion time with long TR/TE; "
+            + metric_evidence(TR=tr, TE=te, TI=ti),
+        )
+
+    if has_gr and (
+        (is_finite(te) and te >= 12 and (not is_finite(fa) or fa <= 45))
+        or (is_finite(echo_numbers) and echo_numbers >= 2 and is_finite(te) and te >= 8)
+        or (has_phase and is_finite(te) and te >= 8)
+    ):
+        return (
+            "T2star/SWI",
+            "parameter heuristic: GRE/phase or multi-echo pattern; "
+            + metric_evidence(TR=tr, TE=te, FA=fa, EchoNumbers=echo_numbers),
+        )
+
+    if is_finite(ti) and 450 <= ti < 1400 and is_finite(te) and te <= 20:
+        if (is_finite(fa) and fa <= 30) or has_gr or has_ir:
+            return (
+                "T1",
+                "parameter heuristic: T1 inversion-prepared short-TE pattern; "
+                + metric_evidence(TR=tr, TE=te, TI=ti, FA=fa),
+            )
+
+    if is_finite(te) and te >= 60:
+        if (is_finite(tr) and tr >= 1500) or (is_finite(etl) and etl >= 3) or has_se:
+            return (
+                "T2",
+                "parameter heuristic: long TE with long TR/TSE-FSE pattern; "
+                + metric_evidence(TR=tr, TE=te, ETL=etl),
+            )
+
+    if is_finite(te) and te <= 35:
+        if is_finite(tr) and 100 <= tr <= 1200:
+            return (
+                "T1",
+                "parameter heuristic: short TR and short TE; "
+                + metric_evidence(TR=tr, TE=te, FA=fa),
+            )
+        if has_gr and is_finite(tr) and tr < 100 and is_finite(te) and te <= 10:
+            if not is_finite(fa) or fa <= 15:
+                return (
+                    "T1",
+                    "parameter heuristic: short-TR/short-TE low-flip-angle GRE; "
+                    + metric_evidence(TR=tr, TE=te, FA=fa, SliceThickness=thickness),
+                )
+
+    if has_magnitude and has_gr and is_finite(te) and te >= 12:
+        return (
+            "T2star/SWI",
+            "parameter heuristic: GRE magnitude image with T2star-range TE; "
+            + metric_evidence(TR=tr, TE=te, FA=fa),
+        )
+
+    return "Other", "no non-description/protocol parameter rule matched"
+
+
+def classify_condition_from_row(
+    row: pd.Series,
+    columns: dict[str, str | None],
+    use_series_protocol_text: bool,
+) -> tuple[str, str]:
+    non_protocol_text = build_search_text(row, columns, CLASSIFICATION_TEXT_KEYS)
+    condition, reason = classify_condition(non_protocol_text)
+    if condition != "Other":
+        return condition, "matched non-description/protocol tags: " + reason
+
+    condition, reason = classify_condition_by_parameters(row, columns)
+    if condition != "Other":
+        return condition, reason
+
+    if use_series_protocol_text:
+        series_protocol_text = build_search_text(row, columns, SERIES_PROTOCOL_TEXT_KEYS)
+        condition, text_reason = classify_condition(series_protocol_text)
+        if condition != "Other":
+            return condition, "matched SeriesDescription/ProtocolName fallback: " + text_reason
+
+    return "Other", reason
 
 
 def classify_dimensionality(
@@ -527,11 +834,18 @@ def add_derived_columns(
     df: pd.DataFrame,
     columns: dict[str, str | None],
     infer_dim_from_geometry: bool,
+    use_series_protocol_text: bool,
 ) -> pd.DataFrame:
     out = df.copy()
 
-    search_text = out.apply(lambda row: build_search_text(row, columns), axis=1)
-    classified = search_text.map(classify_condition)
+    classified = out.apply(
+        lambda row: classify_condition_from_row(
+            row,
+            columns,
+            use_series_protocol_text=use_series_protocol_text,
+        ),
+        axis=1,
+    )
     out["image_condition"] = [item[0] for item in classified]
     out["condition_reason"] = [item[1] for item in classified]
 
@@ -539,7 +853,7 @@ def add_derived_columns(
         lambda row: classify_dimensionality(
             row,
             columns,
-            build_search_text(row, columns),
+            build_search_text(row, columns, CLASSIFICATION_TEXT_KEYS),
             infer_dim_from_geometry,
         ),
         axis=1,
@@ -553,6 +867,9 @@ def add_derived_columns(
     out["echo_time_ms"] = series_from_column(out, columns["echo_time"])
     out["inversion_time_ms"] = series_from_column(out, columns["inversion_time"])
     out["flip_angle_deg"] = series_from_column(out, columns["flip_angle"])
+    out["echo_train_length"] = series_from_column(out, columns["echo_train_length"])
+    out["echo_numbers"] = series_from_column(out, columns["echo_numbers"])
+    out["diffusion_b_value"] = series_from_column(out, columns["diffusion_b_value"])
     out["number_of_slices"] = series_from_column(out, columns["number_of_slices"])
     out["field_strength_t"] = series_from_column(out, columns["magnetic_field_strength"])
 
@@ -592,6 +909,10 @@ def add_derived_columns(
     out["pixel_spacing_mm"] = [
         format_pair(row, col)
         for row, col in zip(out["pixel_spacing_row_mm"], out["pixel_spacing_col_mm"])
+    ]
+    out["fov_mm"] = [
+        format_pair(row, col, decimals=1)
+        for row, col in zip(out["fov_row_mm"], out["fov_col_mm"])
     ]
 
     return out
@@ -649,12 +970,90 @@ def dimension_category(series: pd.Series) -> pd.Categorical:
     return pd.Categorical(series, categories=observed + extra, ordered=True)
 
 
+def format_analysis_group(condition: object, dimensionality: object) -> str:
+    condition_text = clean_text(condition) or "Other"
+    dimension_text = clean_text(dimensionality) or "Unknown"
+    return f"{condition_text}({dimension_text})"
+
+
+def ordered_condition_values(series: pd.Series) -> list[str]:
+    values = [clean_text(value) for value in series.dropna()]
+    observed = [item for item in CONDITION_ORDER if item in set(values)]
+    extra = sorted(set(values) - set(CONDITION_ORDER))
+    return observed + extra
+
+
+def ordered_dimension_values(series: pd.Series) -> list[str]:
+    values = [clean_text(value) for value in series.dropna()]
+    observed = [item for item in DIMENSION_ORDER if item in set(values)]
+    extra = sorted(set(values) - set(DIMENSION_ORDER))
+    return observed + extra
+
+
+def ordered_analysis_groups(df: pd.DataFrame) -> list[str]:
+    if df.empty or "image_condition" not in df or "dimensionality" not in df:
+        return []
+    present = set(
+        format_analysis_group(condition, dimensionality)
+        for condition, dimensionality in zip(df["image_condition"], df["dimensionality"])
+    )
+    ordered = []
+    for condition in ordered_condition_values(df["image_condition"]):
+        for dimensionality in ordered_dimension_values(df["dimensionality"]):
+            group = format_analysis_group(condition, dimensionality)
+            if group in present:
+                ordered.append(group)
+    extra = sorted(present - set(ordered))
+    return ordered + extra
+
+
+def add_analysis_filter(df: pd.DataFrame, max_slice_mm: float | None) -> pd.DataFrame:
+    out = df.copy()
+    out["analysis_group"] = [
+        format_analysis_group(condition, dimensionality)
+        for condition, dimensionality in zip(out["image_condition"], out["dimensionality"])
+    ]
+
+    if max_slice_mm is None or max_slice_mm <= 0:
+        out["analysis_excluded"] = False
+        out["analysis_exclusion_reason"] = ""
+        return out
+
+    thickness = pd.to_numeric(out.get("slice_thickness_mm"), errors="coerce")
+    spacing = pd.to_numeric(out.get("slice_spacing_mm"), errors="coerce")
+    thick_excluded = thickness.ge(max_slice_mm).fillna(False)
+    spacing_excluded = spacing.ge(max_slice_mm).fillna(False)
+    out["analysis_excluded"] = thick_excluded | spacing_excluded
+
+    reasons = []
+    for thick, space, thick_value, space_value in zip(
+        thick_excluded,
+        spacing_excluded,
+        thickness,
+        spacing,
+    ):
+        row_reasons = []
+        if thick:
+            row_reasons.append(f"slice_thickness_mm={thick_value:g} >= {max_slice_mm:g}")
+        if space:
+            row_reasons.append(f"slice_spacing_mm={space_value:g} >= {max_slice_mm:g}")
+        reasons.append("; ".join(row_reasons))
+    out["analysis_exclusion_reason"] = reasons
+    return out
+
+
 def make_counts(df: pd.DataFrame) -> pd.DataFrame:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
     counts = (
-        df.groupby(["image_condition", "dimensionality"], dropna=False)
+        df.groupby(["image_condition", "dimensionality", "analysis_group"], dropna=False)
         .size()
         .reset_index(name="series_count")
-        .sort_values(["image_condition", "dimensionality"])
+    )
+    group_order = {group: idx for idx, group in enumerate(ordered_analysis_groups(df))}
+    counts["_order"] = counts["analysis_group"].map(group_order).fillna(len(group_order))
+    counts = counts.sort_values(["_order", "image_condition", "dimensionality"]).drop(
+        columns="_order"
     )
     total = max(len(df), 1)
     counts["percent"] = counts["series_count"] / total * 100.0
@@ -672,10 +1071,12 @@ def top_values(series: pd.Series, max_items: int = 5, decimals: int = 3) -> str:
 
 
 def make_metric_stats(df: pd.DataFrame) -> pd.DataFrame:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
     rows = []
-    group_cols = ["image_condition", "dimensionality"]
+    group_cols = ["image_condition", "dimensionality", "analysis_group"]
     for group_values, group in df.groupby(group_cols, dropna=False):
-        condition, dimensionality = group_values
+        condition, dimensionality, analysis_group = group_values
         total = len(group)
         for metric in NUMERIC_METRICS:
             if metric not in group:
@@ -684,6 +1085,7 @@ def make_metric_stats(df: pd.DataFrame) -> pd.DataFrame:
             row = {
                 "image_condition": condition,
                 "dimensionality": dimensionality,
+                "analysis_group": analysis_group,
                 "metric": metric,
                 "series_count": total,
                 "valid_count": int(values.shape[0]),
@@ -721,6 +1123,8 @@ def make_metric_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
     value_specs = {
         "slice_thickness_mm": 3,
         "slice_spacing_mm": 3,
@@ -730,17 +1134,23 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
         "matrix_rows": 0,
         "matrix_columns": 0,
         "matrix_size": None,
+        "fov_row_mm": 1,
+        "fov_col_mm": 1,
+        "fov_mm": None,
         "pixel_spacing_mm": None,
         "number_of_slices": 0,
         "repetition_time_ms": 1,
         "echo_time_ms": 1,
         "inversion_time_ms": 1,
         "flip_angle_deg": 1,
+        "echo_train_length": 0,
+        "echo_numbers": 0,
+        "diffusion_b_value": 1,
     }
     rows = []
-    group_cols = ["image_condition", "dimensionality"]
+    group_cols = ["image_condition", "dimensionality", "analysis_group"]
 
-    for (condition, dimensionality), group in df.groupby(group_cols, dropna=False):
+    for (condition, dimensionality, analysis_group), group in df.groupby(group_cols, dropna=False):
         group_total = len(group)
         for metric, decimals in value_specs.items():
             if metric not in group:
@@ -755,6 +1165,7 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
                     {
                         "image_condition": condition,
                         "dimensionality": dimensionality,
+                        "analysis_group": analysis_group,
                         "metric": metric,
                         "value": value,
                         "series_count": int(count),
@@ -766,9 +1177,86 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
     if value_counts.empty:
         return value_counts
     return value_counts.sort_values(
-        ["image_condition", "dimensionality", "metric", "series_count"],
-        ascending=[True, True, True, False],
+        ["analysis_group", "metric", "series_count"],
+        ascending=[True, True, False],
     )
+
+
+def summarize_numeric(series: pd.Series, decimals: int = 2) -> str:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return ""
+    median = values.median()
+    q1 = values.quantile(0.25)
+    q3 = values.quantile(0.75)
+    return f"{median:.{decimals}f} [{q1:.{decimals}f}-{q3:.{decimals}f}]"
+
+
+def numeric_valid_count(series: pd.Series) -> int:
+    return int(pd.to_numeric(series, errors="coerce").notna().sum())
+
+
+def top_text_values(series: pd.Series, max_items: int = 5) -> str:
+    clean = series.map(clean_text).replace("", np.nan).dropna()
+    if clean.empty:
+        return ""
+    counts = clean.value_counts(dropna=True).head(max_items)
+    return "; ".join(f"{value} (n={count})" for value, count in counts.items())
+
+
+def make_condition_dimension_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
+
+    decimals = {
+        "slice_thickness_mm": 2,
+        "slice_spacing_mm": 2,
+        "slice_gap_mm": 2,
+        "pixel_spacing_row_mm": 3,
+        "pixel_spacing_col_mm": 3,
+        "fov_row_mm": 1,
+        "fov_col_mm": 1,
+        "matrix_rows": 0,
+        "matrix_columns": 0,
+        "number_of_slices": 0,
+        "repetition_time_ms": 1,
+        "echo_time_ms": 1,
+        "inversion_time_ms": 1,
+    }
+
+    rows = []
+    group_cols = ["image_condition", "dimensionality", "analysis_group"]
+    for (condition, dimensionality, analysis_group), group in df.groupby(
+        group_cols,
+        dropna=False,
+    ):
+        row = {
+            "image_condition": condition,
+            "dimensionality": dimensionality,
+            "analysis_group": analysis_group,
+            "series_count": len(group),
+        }
+        for metric, output_name in SUMMARY_METRICS:
+            if metric not in group:
+                row[output_name] = ""
+                row[f"{output_name}_n"] = 0
+                continue
+            row[output_name] = summarize_numeric(group[metric], decimals.get(metric, 2))
+            row[f"{output_name}_n"] = numeric_valid_count(group[metric])
+
+        row["common_matrix_size"] = top_text_values(group.get("matrix_size", pd.Series(dtype=str)))
+        row["common_fov_mm"] = top_text_values(group.get("fov_mm", pd.Series(dtype=str)))
+        row["common_pixel_spacing_mm"] = top_text_values(
+            group.get("pixel_spacing_mm", pd.Series(dtype=str))
+        )
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        return summary
+    group_order = {group: idx for idx, group in enumerate(ordered_analysis_groups(df))}
+    summary["_order"] = summary["analysis_group"].map(group_order).fillna(len(group_order))
+    return summary.sort_values("_order").drop(columns="_order")
 
 
 def write_csv(df: pd.DataFrame, path: Path) -> None:
@@ -832,16 +1320,27 @@ def save_counts_plot(counts: pd.DataFrame, figures_dir: Path) -> Path | None:
     path = figures_dir / "counts_by_condition_dimension.png"
 
     plot_df = counts.copy()
-    plot_df["image_condition"] = condition_category(plot_df["image_condition"])
-    plot_df["dimensionality"] = dimension_category(plot_df["dimensionality"])
+    if "analysis_group" not in plot_df:
+        plot_df["analysis_group"] = [
+            format_analysis_group(condition, dimensionality)
+            for condition, dimensionality in zip(
+                plot_df["image_condition"],
+                plot_df["dimensionality"],
+            )
+        ]
+    group_order = list(plot_df["analysis_group"])
+    plot_df["analysis_group"] = pd.Categorical(
+        plot_df["analysis_group"],
+        categories=group_order,
+        ordered=True,
+    )
 
-    plt.figure(figsize=(10, 5.8))
+    plt.figure(figsize=(max(10, 0.65 * len(plot_df) + 3), 5.8))
     if sns is not None:
         kwargs = {
             "data": plot_df,
-            "x": "image_condition",
+            "x": "analysis_group",
             "y": "series_count",
-            "hue": "dimensionality",
         }
         if seaborn_at_least(0, 12):
             kwargs["errorbar"] = None
@@ -849,19 +1348,17 @@ def save_counts_plot(counts: pd.DataFrame, figures_dir: Path) -> Path | None:
             kwargs["ci"] = None
         ax = sns.barplot(**kwargs)
     else:
-        pivot = plot_df.pivot_table(
-            index="image_condition",
-            columns="dimensionality",
-            values="series_count",
-            fill_value=0,
-            aggfunc="sum",
-        )
-        ax = pivot.plot(kind="bar", figsize=(10, 5.8)).axes
-    ax.set_title("Series count by image condition and dimensionality")
-    ax.set_xlabel("Image condition")
+        ax = plot_df.plot(
+            kind="bar",
+            x="analysis_group",
+            y="series_count",
+            legend=False,
+            figsize=(max(10, 0.65 * len(plot_df) + 3), 5.8),
+        ).axes
+    ax.set_title("Series count by condition and dimensionality")
+    ax.set_xlabel("Condition (dimensionality)")
     ax.set_ylabel("Series count")
-    ax.tick_params(axis="x", rotation=30)
-    ax.legend(title="Dimensionality")
+    ax.tick_params(axis="x", rotation=45)
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -875,8 +1372,13 @@ def save_metric_boxplot(
     figures_dir: Path,
     include_other: bool,
 ) -> Path | None:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
     values = pd.to_numeric(df.get(metric), errors="coerce")
-    plot_df = df.loc[values.notna(), ["image_condition", "dimensionality"]].copy()
+    plot_df = df.loc[
+        values.notna(),
+        ["image_condition", "dimensionality", "analysis_group"],
+    ].copy()
     plot_df[metric] = values[values.notna()]
     if not include_other:
         plot_df = plot_df[plot_df["image_condition"] != "Other"]
@@ -885,54 +1387,42 @@ def save_metric_boxplot(
 
     figures_dir.mkdir(parents=True, exist_ok=True)
     path = figures_dir / f"box_{safe_filename(metric)}.png"
-    plot_df["image_condition"] = condition_category(plot_df["image_condition"])
-    plot_df["dimensionality"] = dimension_category(plot_df["dimensionality"])
+    group_order = ordered_analysis_groups(plot_df)
+    plot_df["analysis_group"] = pd.Categorical(
+        plot_df["analysis_group"],
+        categories=group_order,
+        ordered=True,
+    )
 
-    plt.figure(figsize=(11, 5.8))
+    plt.figure(figsize=(max(11, 0.72 * len(group_order) + 3), 5.8))
     if sns is not None:
-        strip_palette = {
-            str(level): "black"
-            for level in plot_df["dimensionality"].dropna().astype(str).unique()
-        }
         ax = sns.boxplot(
             data=plot_df,
-            x="image_condition",
+            x="analysis_group",
             y=metric,
-            hue="dimensionality",
             showfliers=False,
+            order=group_order,
         )
         sns.stripplot(
             data=plot_df,
-            x="image_condition",
+            x="analysis_group",
             y=metric,
-            hue="dimensionality",
-            dodge=True,
-            palette=strip_palette,
+            order=group_order,
+            color="black",
             alpha=0.22,
             size=2,
         )
     else:
-        ax = plot_df.boxplot(column=metric, by="image_condition", figsize=(11, 5.8))
+        ax = plot_df.boxplot(
+            column=metric,
+            by="analysis_group",
+            figsize=(max(11, 0.72 * len(group_order) + 3), 5.8),
+        )
         plt.suptitle("")
     ax.set_title(label)
-    ax.set_xlabel("Image condition")
+    ax.set_xlabel("Condition (dimensionality)")
     ax.set_ylabel(label)
-    ax.tick_params(axis="x", rotation=30)
-    if sns is not None:
-        handles, labels = ax.get_legend_handles_labels()
-        unique = []
-        seen = set()
-        for handle, label_text in zip(handles, labels):
-            if label_text in seen:
-                continue
-            seen.add(label_text)
-            unique.append((handle, label_text))
-        if unique:
-            ax.legend(
-                [item[0] for item in unique],
-                [item[1] for item in unique],
-                title="Dimensionality",
-            )
+    ax.tick_params(axis="x", rotation=45)
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -940,6 +1430,8 @@ def save_metric_boxplot(
 
 
 def save_scatter_plot(df: pd.DataFrame, figures_dir: Path, include_other: bool) -> Path | None:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
     required = ["slice_thickness_mm", "slice_spacing_mm"]
     if any(col not in df for col in required):
         return None
@@ -958,20 +1450,21 @@ def save_scatter_plot(df: pd.DataFrame, figures_dir: Path, include_other: bool) 
 
     figures_dir.mkdir(parents=True, exist_ok=True)
     path = figures_dir / "scatter_slice_thickness_vs_spacing.png"
-    plt.figure(figsize=(8.5, 6.2))
+    group_order = ordered_analysis_groups(plot_df)
+    plt.figure(figsize=(9.5, 6.4))
     if sns is not None:
         ax = sns.scatterplot(
             data=plot_df,
             x="slice_thickness_mm",
             y="slice_spacing_mm",
-            hue="image_condition",
-            style="dimensionality",
+            hue="analysis_group",
+            hue_order=group_order,
             alpha=0.78,
             s=52,
         )
     else:
         ax = plt.gca()
-        for condition, group in plot_df.groupby("image_condition"):
+        for condition, group in plot_df.groupby("analysis_group"):
             ax.scatter(
                 group["slice_thickness_mm"],
                 group["slice_spacing_mm"],
@@ -982,6 +1475,77 @@ def save_scatter_plot(df: pd.DataFrame, figures_dir: Path, include_other: bool) 
     ax.set_xlabel("Slice thickness (mm)")
     ax.set_ylabel("Slice spacing (mm)")
     ax.legend(loc="best", fontsize="small")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+    return path
+
+
+def save_categorical_count_heatmap(
+    df: pd.DataFrame,
+    metric: str,
+    label: str,
+    figures_dir: Path,
+    include_other: bool,
+    max_values: int = 12,
+) -> Path | None:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
+    if metric not in df:
+        return None
+
+    plot_df = df[["image_condition", "dimensionality", "analysis_group", metric]].copy()
+    plot_df[metric] = plot_df[metric].map(clean_text)
+    plot_df = plot_df[plot_df[metric] != ""]
+    if not include_other:
+        plot_df = plot_df[plot_df["image_condition"] != "Other"]
+    if plot_df.empty:
+        return None
+
+    top_values_for_metric = plot_df[metric].value_counts().head(max_values).index
+    plot_df = plot_df[plot_df[metric].isin(top_values_for_metric)]
+    group_order = ordered_analysis_groups(plot_df)
+    pivot = (
+        plot_df.pivot_table(
+            index="analysis_group",
+            columns=metric,
+            values="image_condition",
+            aggfunc="count",
+            fill_value=0,
+        )
+        .reindex(index=group_order, columns=top_values_for_metric, fill_value=0)
+        .astype(int)
+    )
+    if pivot.empty:
+        return None
+
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    path = figures_dir / f"heatmap_{safe_filename(metric)}.png"
+    plt.figure(figsize=(max(8, 0.7 * pivot.shape[1] + 3), max(4.5, 0.45 * pivot.shape[0] + 2)))
+    if sns is not None:
+        ax = sns.heatmap(pivot, annot=True, fmt="d", cmap="Blues", cbar_kws={"label": "Series count"})
+    else:
+        ax = plt.gca()
+        image = ax.imshow(pivot.values, aspect="auto", cmap="Blues")
+        plt.colorbar(image, ax=ax, label="Series count")
+        ax.set_xticks(np.arange(pivot.shape[1]))
+        ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+        ax.set_yticks(np.arange(pivot.shape[0]))
+        ax.set_yticklabels(pivot.index)
+        for row_index in range(pivot.shape[0]):
+            for col_index in range(pivot.shape[1]):
+                ax.text(
+                    col_index,
+                    row_index,
+                    str(pivot.iat[row_index, col_index]),
+                    ha="center",
+                    va="center",
+                    color="black",
+                    fontsize=8,
+                )
+    ax.set_title(f"{label} frequency by condition")
+    ax.set_xlabel(label)
+    ax.set_ylabel("Condition (dimensionality)")
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -1012,6 +1576,16 @@ def make_figures(
     if scatter_path:
         paths.append(scatter_path)
 
+    matrix_path = save_categorical_count_heatmap(
+        df,
+        "matrix_size",
+        "Matrix size",
+        figures_dir,
+        include_other,
+    )
+    if matrix_path:
+        paths.append(matrix_path)
+
     return paths
 
 
@@ -1028,11 +1602,15 @@ def make_report(
     input_path: Path,
     output_dir: Path,
     df: pd.DataFrame,
+    analysis_df: pd.DataFrame,
+    excluded_df: pd.DataFrame,
     columns: dict[str, str | None],
     counts: pd.DataFrame,
     stats: pd.DataFrame,
+    summary: pd.DataFrame,
     figures: list[Path],
     encoding: str,
+    max_slice_mm: float | None,
 ) -> str:
     detected_rows = [
         {"logical_field": key, "csv_column": value or ""}
@@ -1041,13 +1619,13 @@ def make_report(
     detected = pd.DataFrame(detected_rows)
 
     condition_counts = (
-        df["image_condition"]
+        analysis_df["image_condition"]
         .value_counts(dropna=False)
         .rename_axis("image_condition")
         .reset_index(name="series_count")
     )
     dimension_counts = (
-        df["dimensionality"]
+        analysis_df["dimensionality"]
         .value_counts(dropna=False)
         .rename_axis("dimensionality")
         .reset_index(name="series_count")
@@ -1055,35 +1633,47 @@ def make_report(
 
     missing = []
     for metric in NUMERIC_METRICS:
-        if metric in df:
-            valid = pd.to_numeric(df[metric], errors="coerce").notna().sum()
+        if metric in analysis_df:
+            valid = pd.to_numeric(analysis_df[metric], errors="coerce").notna().sum()
             missing.append(
                 {
                     "metric": metric,
                     "valid_count": int(valid),
-                    "missing_percent": (len(df) - valid) / max(len(df), 1) * 100.0,
+                    "missing_percent": (len(analysis_df) - valid)
+                    / max(len(analysis_df), 1)
+                    * 100.0,
                 }
             )
-    missing_df = pd.DataFrame(missing).sort_values("missing_percent")
+    if missing:
+        missing_df = pd.DataFrame(missing).sort_values("missing_percent")
+    else:
+        missing_df = pd.DataFrame(columns=["metric", "valid_count", "missing_percent"])
 
-    key_stats = stats[
-        stats["metric"].isin(
-            [
-                "slice_thickness_mm",
-                "slice_spacing_mm",
-                "matrix_rows",
-                "matrix_columns",
-                "pixel_spacing_row_mm",
-                "echo_time_ms",
-                "repetition_time_ms",
-            ]
-        )
-    ].copy()
+    if stats.empty or "metric" not in stats:
+        key_stats = pd.DataFrame()
+    else:
+        key_stats = stats[
+            stats["metric"].isin(
+                [
+                    "slice_thickness_mm",
+                    "slice_spacing_mm",
+                    "slice_gap_mm",
+                    "fov_row_mm",
+                    "fov_col_mm",
+                    "matrix_rows",
+                    "matrix_columns",
+                    "pixel_spacing_row_mm",
+                    "echo_time_ms",
+                    "repetition_time_ms",
+                ]
+            )
+        ].copy()
     if not key_stats.empty:
         key_stats = key_stats[
             [
                 "image_condition",
                 "dimensionality",
+                "analysis_group",
                 "metric",
                 "valid_count",
                 "median",
@@ -1093,9 +1683,31 @@ def make_report(
             ]
         ]
 
+    summary_display_columns = [
+        "analysis_group",
+        "series_count",
+        "slice_thickness_mm",
+        "space_between_slices_mm",
+        "fov_row_mm",
+        "fov_col_mm",
+        "common_matrix_size",
+        "common_fov_mm",
+        "common_pixel_spacing_mm",
+    ]
+    summary_display = summary[
+        [column for column in summary_display_columns if column in summary]
+    ].copy()
+
     figure_lines = "\n".join(
         f"- `{path.relative_to(output_dir)}`" for path in figures
     ) or "- No figures generated."
+    if max_slice_mm is None or max_slice_mm <= 0:
+        exclusion_line = "No slice-thickness/spacing exclusion threshold was applied."
+    else:
+        exclusion_line = (
+            f"Rows with SliceThickness or SpacingBetweenSlices >= {max_slice_mm:g} mm "
+            "were excluded from counts, statistics, and figures."
+        )
 
     report = f"""# DICOM Tag Analysis Report
 
@@ -1103,14 +1715,23 @@ Input: `{input_path}`
 
 Output directory: `{output_dir}`
 
-Rows: {len(df)}
+Input rows: {len(df)}
+
+Rows used for analysis: {len(analysis_df)}
+
+Rows excluded from analysis: {len(excluded_df)}
+
+Slice exclusion rule: {exclusion_line}
 
 CSV encoding: `{encoding}`
 
 ## Generated files
 
 - `series_with_derived_columns.csv`
+- `included_series_for_analysis.csv`
+- `excluded_series_from_analysis.csv`
 - `condition_dimension_counts.csv`
+- `summary_by_condition_dimension.csv`
 - `metric_stats_by_condition_dimension.csv`
 - `metric_value_counts_by_condition_dimension.csv`
 - `detected_columns.json`
@@ -1129,6 +1750,10 @@ CSV encoding: `{encoding}`
 
 {markdown_table(counts)}
 
+## Geometry Summary By Condition
+
+{markdown_table(summary_display, max_rows=40)}
+
 ## Key metric summary
 
 {markdown_table(key_stats, max_rows=40)}
@@ -1143,14 +1768,21 @@ CSV encoding: `{encoding}`
 
 ## Notes
 
-- Image condition and 2D/3D labels are heuristic classifications based mainly on
-  series description, protocol name, sequence name, image type, and MR acquisition
-  type when present.
+- Image condition labels are heuristic classifications based on non-description
+  tags first, especially SequenceName, ScanningSequence, SequenceVariant,
+  ScanOptions, ImageType, AcquisitionContrast, diffusion tags, TR, TE, TI, and
+  FlipAngle. SeriesDescription and ProtocolName are ignored unless
+  `--use-series-protocol-text` is used.
+- 2D/3D labels are based mainly on MRAcquisitionType and non-description
+  sequence/acquisition tags when present.
 - Review `condition_reason` and `dimensionality_reason` in
   `series_with_derived_columns.csv` for questionable series.
+- Rows with `analysis_excluded=True` are kept in `series_with_derived_columns.csv`
+  but are not used for counts, statistics, or figures.
 - If many rows are `Other` or `Unknown`, add more descriptive DICOM tag columns to
-  the input CSV, especially SeriesDescription, ProtocolName, SequenceName, ImageType,
-  and MRAcquisitionType.
+  the input CSV, especially SequenceName, ScanningSequence, SequenceVariant,
+  ScanOptions, ImageType, AcquisitionContrast, DiffusionBValue, EchoTrainLength,
+  EchoNumbers, and MRAcquisitionType.
 """
     return report
 
@@ -1163,22 +1795,36 @@ def save_outputs(
     no_plots: bool,
     include_other_plots: bool,
     encoding: str,
+    max_slice_mm: float | None,
 ) -> dict[str, Path | list[Path]]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    counts = make_counts(df)
-    stats = make_metric_stats(df)
-    value_counts = make_value_counts(df)
+    if "analysis_excluded" not in df:
+        df = add_analysis_filter(df, max_slice_mm)
+
+    analysis_df = df[~df["analysis_excluded"]].copy()
+    excluded_df = df[df["analysis_excluded"]].copy()
+
+    counts = make_counts(analysis_df)
+    stats = make_metric_stats(analysis_df)
+    value_counts = make_value_counts(analysis_df)
+    summary = make_condition_dimension_summary(analysis_df)
 
     derived_path = output_dir / "series_with_derived_columns.csv"
+    included_path = output_dir / "included_series_for_analysis.csv"
+    excluded_path = output_dir / "excluded_series_from_analysis.csv"
     counts_path = output_dir / "condition_dimension_counts.csv"
+    summary_path = output_dir / "summary_by_condition_dimension.csv"
     stats_path = output_dir / "metric_stats_by_condition_dimension.csv"
     value_counts_path = output_dir / "metric_value_counts_by_condition_dimension.csv"
     columns_path = output_dir / "detected_columns.json"
     report_path = output_dir / "analysis_report.md"
 
     write_csv(df, derived_path)
+    write_csv(analysis_df, included_path)
+    write_csv(excluded_df, excluded_path)
     write_csv(counts, counts_path)
+    write_csv(summary, summary_path)
     write_csv(stats, stats_path)
     write_csv(value_counts, value_counts_path)
 
@@ -1189,23 +1835,30 @@ def save_outputs(
 
     figures: list[Path] = []
     if not no_plots:
-        figures = make_figures(df, counts, output_dir, include_other_plots)
+        figures = make_figures(analysis_df, counts, output_dir, include_other_plots)
 
     report = make_report(
         input_path=input_path,
         output_dir=output_dir,
         df=df,
+        analysis_df=analysis_df,
+        excluded_df=excluded_df,
         columns=columns,
         counts=counts,
         stats=stats,
+        summary=summary,
         figures=figures,
         encoding=encoding,
+        max_slice_mm=max_slice_mm,
     )
     report_path.write_text(report, encoding="utf-8")
 
     return {
         "derived": derived_path,
+        "included": included_path,
+        "excluded": excluded_path,
         "counts": counts_path,
+        "summary": summary_path,
         "stats": stats_path,
         "value_counts": value_counts_path,
         "columns": columns_path,
@@ -1250,11 +1903,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include Other condition in metric boxplots and scatter plots.",
     )
     parser.add_argument(
+        "--exclude-slice-mm",
+        type=float,
+        default=DEFAULT_EXCLUDE_SLICE_MM,
+        help=(
+            "Exclude rows from counts, statistics, and figures when SliceThickness "
+            "or SpacingBetweenSlices is greater than or equal to this value in mm. "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--infer-dim-from-geometry",
         action="store_true",
         help=(
             "If textual 2D/3D hints are missing, infer 3D for thin contiguous "
             "slices and 2D for thicker slices."
+        ),
+    )
+    parser.add_argument(
+        "--use-series-protocol-text",
+        action="store_true",
+        help=(
+            "Also use SeriesDescription and ProtocolName as a last-resort image "
+            "condition fallback. By default, condition classification ignores them."
         ),
     )
     return parser
@@ -1280,7 +1951,9 @@ def main(argv: list[str] | None = None) -> int:
         raw_df,
         columns,
         infer_dim_from_geometry=args.infer_dim_from_geometry,
+        use_series_protocol_text=args.use_series_protocol_text,
     )
+    derived = add_analysis_filter(derived, args.exclude_slice_mm)
     outputs = save_outputs(
         input_path=input_path,
         df=derived,
@@ -1289,11 +1962,16 @@ def main(argv: list[str] | None = None) -> int:
         no_plots=args.no_plots,
         include_other_plots=args.include_other_plots,
         encoding=encoding,
+        max_slice_mm=args.exclude_slice_mm,
     )
 
-    print(f"Analyzed {len(derived)} series")
+    analyzed_count = int((~derived["analysis_excluded"]).sum())
+    excluded_count = int(derived["analysis_excluded"].sum())
+    print(f"Loaded {len(derived)} series")
+    print(f"Analyzed {analyzed_count} series; excluded {excluded_count}")
     print(f"Report: {outputs['report']}")
     print(f"Derived CSV: {outputs['derived']}")
+    print(f"Summary CSV: {outputs['summary']}")
     print(f"Stats CSV: {outputs['stats']}")
     if not args.no_plots:
         print(f"Figures: {len(outputs['figures'])}")
