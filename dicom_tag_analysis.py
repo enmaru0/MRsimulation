@@ -64,6 +64,7 @@ CONDITION_ORDER = [
 ]
 
 DIMENSION_ORDER = ["2D", "3D", "Unknown"]
+PLANE_ORDER = ["AX", "SAG", "COR", "Oblique", "Unknown"]
 
 DEFAULT_EXCLUDE_SLICE_MM = 10.0
 DEFAULT_EXCLUDE_SLICES_LE = 7
@@ -159,6 +160,21 @@ COLUMN_ALIASES = {
         "(0020,4000)",
         "0020,4000",
         "00204000",
+    ],
+    "image_orientation_patient": [
+        "ImageOrientationPatient",
+        "Image Orientation Patient",
+        "Image Orientation (Patient)",
+        "(0020,0037)",
+        "0020,0037",
+        "00200037",
+    ],
+    "patient_orientation": [
+        "PatientOrientation",
+        "Patient Orientation",
+        "(0020,0020)",
+        "0020,0020",
+        "00200020",
     ],
     "slice_thickness": [
         "SliceThickness",
@@ -829,6 +845,118 @@ def classify_dimensionality(
     return "Unknown", "no rule matched"
 
 
+def plane_from_normal(normal: np.ndarray, oblique_threshold: float = 0.80) -> tuple[str, float]:
+    norm = float(np.linalg.norm(normal))
+    if not np.isfinite(norm) or norm <= 1e-6:
+        return "Unknown", np.nan
+
+    unit = np.asarray(normal, dtype=np.float64) / norm
+    abs_unit = np.abs(unit)
+    axis = int(np.argmax(abs_unit))
+    max_component = float(abs_unit[axis])
+    obliquity_deg = float(np.degrees(np.arccos(np.clip(max_component, -1.0, 1.0))))
+    if max_component < oblique_threshold:
+        return "Oblique", obliquity_deg
+    if axis == 0:
+        return "SAG", obliquity_deg
+    if axis == 1:
+        return "COR", obliquity_deg
+    return "AX", obliquity_deg
+
+
+def classify_plane_from_iop(value: object) -> tuple[str, str, float]:
+    numbers = extract_numbers(value)
+    if len(numbers) < 6:
+        return "Unknown", "ImageOrientationPatient missing or incomplete", np.nan
+    row_cosines = np.asarray(numbers[:3], dtype=np.float64)
+    col_cosines = np.asarray(numbers[3:6], dtype=np.float64)
+    normal = np.cross(row_cosines, col_cosines)
+    plane, obliquity_deg = plane_from_normal(normal)
+    if plane == "Unknown":
+        return plane, "ImageOrientationPatient normal vector is invalid", obliquity_deg
+    return (
+        plane,
+        "matched ImageOrientationPatient; obliquity_deg="
+        + ("" if pd.isna(obliquity_deg) else f"{obliquity_deg:.1f}"),
+        obliquity_deg,
+    )
+
+
+def orientation_axis(token: str) -> str | None:
+    token = clean_text(token).upper()
+    if not token:
+        return None
+    first = token[0]
+    if first in {"L", "R"}:
+        return "x"
+    if first in {"A", "P"}:
+        return "y"
+    if first in {"H", "F", "S", "I"}:
+        return "z"
+    return None
+
+
+def classify_plane_from_patient_orientation(value: object) -> tuple[str, str, float]:
+    text = clean_text(value)
+    if not text:
+        return "Unknown", "PatientOrientation missing", np.nan
+    tokens = [item for item in re.split(r"[^A-Za-z]+", text.upper()) if item]
+    axes = []
+    for token in tokens[:2]:
+        axis = orientation_axis(token)
+        if axis and axis not in axes:
+            axes.append(axis)
+    if len(axes) < 2:
+        return "Unknown", "PatientOrientation could not be mapped to two in-plane axes", np.nan
+    in_plane = set(axes)
+    if in_plane == {"x", "y"}:
+        return "AX", "matched PatientOrientation axes", 0.0
+    if in_plane == {"x", "z"}:
+        return "COR", "matched PatientOrientation axes", 0.0
+    if in_plane == {"y", "z"}:
+        return "SAG", "matched PatientOrientation axes", 0.0
+    return "Unknown", "PatientOrientation axes were ambiguous", np.nan
+
+
+def classify_plane_from_text(text: str) -> tuple[str, str, float]:
+    spaced, compact = text_forms(text)
+    if has_word(spaced, ["ax", "axi", "axial", "tra", "transverse"]) or has_compact(
+        compact,
+        ["axial", "transverse"],
+    ):
+        return "AX", "matched plane text", np.nan
+    if has_word(spaced, ["sag", "sagittal"]):
+        return "SAG", "matched plane text", np.nan
+    if has_word(spaced, ["cor", "coronal"]):
+        return "COR", "matched plane text", np.nan
+    return "Unknown", "no plane text matched", np.nan
+
+
+def classify_scan_plane(
+    row: pd.Series,
+    columns: dict[str, str | None],
+) -> tuple[str, str, float]:
+    plane, reason, obliquity = classify_plane_from_iop(
+        get_cell(row, columns, "image_orientation_patient")
+    )
+    if plane != "Unknown":
+        return plane, reason, obliquity
+
+    plane, reason, obliquity = classify_plane_from_patient_orientation(
+        get_cell(row, columns, "patient_orientation")
+    )
+    if plane != "Unknown":
+        return plane, reason, obliquity
+
+    plane, reason, obliquity = classify_plane_from_text(
+        build_search_text(row, columns, TEXT_KEYS)
+    )
+    if plane != "Unknown":
+        return plane, reason, obliquity
+
+    return "Unknown", "no ImageOrientationPatient/PatientOrientation/plane text matched", np.nan
+
+
 def series_from_column(df: pd.DataFrame, column: str | None) -> pd.Series:
     if column is None:
         return pd.Series([np.nan] * len(df), index=df.index, dtype="float64")
@@ -865,6 +993,14 @@ def add_derived_columns(
     )
     out["dimensionality"] = [item[0] for item in dimensionality]
     out["dimensionality_reason"] = [item[1] for item in dimensionality]
+
+    plane = out.apply(
+        lambda row: classify_scan_plane(row, columns),
+        axis=1,
+    )
+    out["scan_plane"] = [item[0] for item in plane]
+    out["scan_plane_reason"] = [item[1] for item in plane]
+    out["plane_obliquity_deg"] = [item[2] for item in plane]
 
     out["slice_thickness_mm"] = series_from_column(out, columns["slice_thickness"])
     out["slice_spacing_mm"] = series_from_column(out, columns["spacing_between_slices"])
@@ -1006,9 +1142,16 @@ def dimension_category(series: pd.Series) -> pd.Categorical:
     return pd.Categorical(series, categories=observed + extra, ordered=True)
 
 
-def format_analysis_group(condition: object, dimensionality: object) -> str:
+def format_analysis_group(
+    condition: object,
+    dimensionality: object,
+    scan_plane: object | None = None,
+) -> str:
     condition_text = clean_text(condition) or "Other"
     dimension_text = clean_text(dimensionality) or "Unknown"
+    plane_text = clean_text(scan_plane)
+    if plane_text:
+        return f"{condition_text}({dimension_text},{plane_text})"
     return f"{condition_text}({dimension_text})"
 
 
@@ -1026,19 +1169,35 @@ def ordered_dimension_values(series: pd.Series) -> list[str]:
     return observed + extra
 
 
+def ordered_plane_values(series: pd.Series) -> list[str]:
+    values = [clean_text(value) for value in series.dropna()]
+    observed = [item for item in PLANE_ORDER if item in set(values)]
+    extra = sorted(set(values) - set(PLANE_ORDER))
+    return observed + extra
+
+
 def ordered_analysis_groups(df: pd.DataFrame) -> list[str]:
     if df.empty or "image_condition" not in df or "dimensionality" not in df:
         return []
+    if "scan_plane" not in df:
+        planes = pd.Series([""] * len(df), index=df.index)
+    else:
+        planes = df["scan_plane"]
     present = set(
-        format_analysis_group(condition, dimensionality)
-        for condition, dimensionality in zip(df["image_condition"], df["dimensionality"])
+        format_analysis_group(condition, dimensionality, plane)
+        for condition, dimensionality, plane in zip(
+            df["image_condition"],
+            df["dimensionality"],
+            planes,
+        )
     )
     ordered = []
     for condition in ordered_condition_values(df["image_condition"]):
         for dimensionality in ordered_dimension_values(df["dimensionality"]):
-            group = format_analysis_group(condition, dimensionality)
-            if group in present:
-                ordered.append(group)
+            for plane in ordered_plane_values(planes):
+                group = format_analysis_group(condition, dimensionality, plane)
+                if group in present:
+                    ordered.append(group)
     extra = sorted(present - set(ordered))
     return ordered + extra
 
@@ -1049,9 +1208,15 @@ def add_analysis_filter(
     exclude_slices_le: int | None = None,
 ) -> pd.DataFrame:
     out = df.copy()
+    if "scan_plane" not in out:
+        out["scan_plane"] = "Unknown"
     out["analysis_group"] = [
-        format_analysis_group(condition, dimensionality)
-        for condition, dimensionality in zip(out["image_condition"], out["dimensionality"])
+        format_analysis_group(condition, dimensionality, plane)
+        for condition, dimensionality, plane in zip(
+            out["image_condition"],
+            out["dimensionality"],
+            out["scan_plane"],
+        )
     ]
 
     if (max_slice_mm is None or max_slice_mm <= 0) and (
@@ -1120,7 +1285,10 @@ def make_counts(df: pd.DataFrame) -> pd.DataFrame:
     if "analysis_group" not in df:
         df = add_analysis_filter(df, None)
     counts = (
-        df.groupby(["image_condition", "dimensionality", "analysis_group"], dropna=False)
+        df.groupby(
+            ["image_condition", "dimensionality", "scan_plane", "analysis_group"],
+            dropna=False,
+        )
         .size()
         .reset_index(name="series_count")
     )
@@ -1148,9 +1316,9 @@ def make_metric_stats(df: pd.DataFrame) -> pd.DataFrame:
     if "analysis_group" not in df:
         df = add_analysis_filter(df, None)
     rows = []
-    group_cols = ["image_condition", "dimensionality", "analysis_group"]
+    group_cols = ["image_condition", "dimensionality", "scan_plane", "analysis_group"]
     for group_values, group in df.groupby(group_cols, dropna=False):
-        condition, dimensionality, analysis_group = group_values
+        condition, dimensionality, scan_plane, analysis_group = group_values
         total = len(group)
         for metric in NUMERIC_METRICS:
             if metric not in group:
@@ -1159,6 +1327,7 @@ def make_metric_stats(df: pd.DataFrame) -> pd.DataFrame:
             row = {
                 "image_condition": condition,
                 "dimensionality": dimensionality,
+                "scan_plane": scan_plane,
                 "analysis_group": analysis_group,
                 "metric": metric,
                 "series_count": total,
@@ -1226,9 +1395,9 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
         "diffusion_b_value": 1,
     }
     rows = []
-    group_cols = ["image_condition", "dimensionality", "analysis_group"]
+    group_cols = ["image_condition", "dimensionality", "scan_plane", "analysis_group"]
 
-    for (condition, dimensionality, analysis_group), group in df.groupby(group_cols, dropna=False):
+    for (condition, dimensionality, scan_plane, analysis_group), group in df.groupby(group_cols, dropna=False):
         group_total = len(group)
         for metric, decimals in value_specs.items():
             if metric not in group:
@@ -1243,6 +1412,7 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
                     {
                         "image_condition": condition,
                         "dimensionality": dimensionality,
+                        "scan_plane": scan_plane,
                         "analysis_group": analysis_group,
                         "metric": metric,
                         "value": value,
@@ -1303,14 +1473,15 @@ def make_condition_dimension_summary(df: pd.DataFrame) -> pd.DataFrame:
     }
 
     rows = []
-    group_cols = ["image_condition", "dimensionality", "analysis_group"]
-    for (condition, dimensionality, analysis_group), group in df.groupby(
+    group_cols = ["image_condition", "dimensionality", "scan_plane", "analysis_group"]
+    for (condition, dimensionality, scan_plane, analysis_group), group in df.groupby(
         group_cols,
         dropna=False,
     ):
         row = {
             "image_condition": condition,
             "dimensionality": dimensionality,
+            "scan_plane": scan_plane,
             "analysis_group": analysis_group,
             "series_count": len(group),
         }
@@ -1350,6 +1521,7 @@ def make_slice_thickness_spacing_counts(df: pd.DataFrame) -> pd.DataFrame:
             columns=[
                 "image_condition",
                 "dimensionality",
+                "scan_plane",
                 "analysis_group",
                 "slice_thickness_mm",
                 "slice_spacing_mm",
@@ -1382,6 +1554,7 @@ def make_slice_thickness_spacing_counts(df: pd.DataFrame) -> pd.DataFrame:
             [
                 "image_condition",
                 "dimensionality",
+                "scan_plane",
                 "analysis_group",
                 "slice_thickness_mm",
                 "slice_spacing_mm",
@@ -1522,7 +1695,7 @@ def save_metric_boxplot(
     values = pd.to_numeric(df.get(metric), errors="coerce")
     plot_df = df.loc[
         values.notna(),
-        ["image_condition", "dimensionality", "analysis_group"],
+        ["image_condition", "dimensionality", "scan_plane", "analysis_group"],
     ].copy()
     plot_df[metric] = values[values.notna()]
     if not include_other:
@@ -1639,7 +1812,12 @@ def save_categorical_count_heatmap(
     if metric not in df:
         return None
 
-    plot_df = df[["image_condition", "dimensionality", "analysis_group", metric]].copy()
+    if "scan_plane" not in df:
+        df = df.copy()
+        df["scan_plane"] = "Unknown"
+    plot_df = df[
+        ["image_condition", "dimensionality", "scan_plane", "analysis_group", metric]
+    ].copy()
     plot_df[metric] = plot_df[metric].map(clean_text)
     plot_df = plot_df[plot_df[metric] != ""]
     if not include_other:
@@ -1736,7 +1914,7 @@ def make_figures(
         "slice_thickness_spacing_mm",
         "Slice thickness x spacing (mm)",
         figures_dir,
-        include_other,
+        True,
     )
     if thickness_spacing_path:
         paths.append(thickness_spacing_path)
@@ -1786,6 +1964,14 @@ def make_report(
         .rename_axis("dimensionality")
         .reset_index(name="series_count")
     )
+    plane_counts = (
+        analysis_df["scan_plane"]
+        .value_counts(dropna=False)
+        .rename_axis("scan_plane")
+        .reset_index(name="series_count")
+        if "scan_plane" in analysis_df
+        else pd.DataFrame(columns=["scan_plane", "series_count"])
+    )
 
     missing = []
     for metric in NUMERIC_METRICS:
@@ -1829,6 +2015,7 @@ def make_report(
             [
                 "image_condition",
                 "dimensionality",
+                "scan_plane",
                 "analysis_group",
                 "metric",
                 "valid_count",
@@ -1841,6 +2028,7 @@ def make_report(
 
     summary_display_columns = [
         "analysis_group",
+        "scan_plane",
         "series_count",
         "slice_thickness_mm",
         "space_between_slices_mm",
@@ -1914,7 +2102,11 @@ CSV encoding: `{encoding}`
 
 {markdown_table(dimension_counts)}
 
-## Condition x dimensionality counts
+## Plane counts
+
+{markdown_table(plane_counts)}
+
+## Condition x dimensionality x plane counts
 
 {markdown_table(counts)}
 
@@ -1943,10 +2135,16 @@ CSV encoding: `{encoding}`
   `--use-series-protocol-text` is used.
 - 2D/3D labels are based mainly on MRAcquisitionType and non-description
   sequence/acquisition tags when present.
+- Scan plane labels are based mainly on ImageOrientationPatient. PatientOrientation
+  and AX/SAG/COR text are used as fallbacks; if these tags are absent, scan_plane
+  will often be `Unknown`.
 - Review `condition_reason` and `dimensionality_reason` in
   `series_with_derived_columns.csv` for questionable series.
 - Rows with `analysis_excluded=True` are kept in `series_with_derived_columns.csv`
   but are not used for counts, statistics, or figures.
+- `figures/heatmap_slice_thickness_spacing_mm.png` is generated only when at
+  least one included row has both SliceThickness and SpacingBetweenSlices. This
+  heatmap includes `Other` groups because it is intended as a geometry QC view.
 - If many rows are `Other` or `Unknown`, add more descriptive DICOM tag columns to
   the input CSV, especially SequenceName, ScanningSequence, SequenceVariant,
   ScanOptions, ImageType, AcquisitionContrast, DiffusionBValue, EchoTrainLength,
