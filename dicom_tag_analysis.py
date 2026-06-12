@@ -1013,6 +1013,7 @@ def add_derived_columns(
     out["diffusion_b_value"] = series_from_column(out, columns["diffusion_b_value"])
     out["number_of_slices"] = series_from_column(out, columns["number_of_slices"])
     out["field_strength_t"] = series_from_column(out, columns["magnetic_field_strength"])
+    out["field_strength_label"] = out["field_strength_t"].map(format_field_strength_label)
 
     if columns["pixel_spacing"] is not None:
         spacing_pairs = out[columns["pixel_spacing"]].map(two_numbers)
@@ -1102,6 +1103,22 @@ def format_pair(first: object, second: object, decimals: int = 3) -> str:
     return f"{float(first):.{decimals}f}x{float(second):.{decimals}f}"
 
 
+def format_field_strength_label(value: object) -> str:
+    try:
+        strength = float(value)
+    except (TypeError, ValueError):
+        return "UnknownField"
+    if not np.isfinite(strength) or strength <= 0:
+        return "UnknownField"
+
+    rounded = round(strength, 2)
+    if abs(rounded - round(rounded)) < 1e-6:
+        text = str(int(round(rounded)))
+    else:
+        text = f"{rounded:.2f}".rstrip("0").rstrip(".")
+    return f"{text}T"
+
+
 def read_csv_auto(path: Path, encoding: str | None, delimiter: str | None) -> tuple[pd.DataFrame, str]:
     encodings = [encoding] if encoding else ["utf-8-sig", "utf-8", "cp932", "shift_jis", "latin1"]
     last_error: Exception | None = None
@@ -1146,12 +1163,19 @@ def format_analysis_group(
     condition: object,
     dimensionality: object,
     scan_plane: object | None = None,
+    field_strength: object | None = None,
 ) -> str:
     condition_text = clean_text(condition) or "Other"
     dimension_text = clean_text(dimensionality) or "Unknown"
     plane_text = clean_text(scan_plane)
+    field_text = clean_text(field_strength)
+    group_parts = [dimension_text]
     if plane_text:
-        return f"{condition_text}({dimension_text},{plane_text})"
+        group_parts.append(plane_text)
+    if field_text:
+        group_parts.append(field_text)
+    if len(group_parts) > 1:
+        return f"{condition_text}({','.join(group_parts)})"
     return f"{condition_text}({dimension_text})"
 
 
@@ -1176,6 +1200,29 @@ def ordered_plane_values(series: pd.Series) -> list[str]:
     return observed + extra
 
 
+def field_strength_sort_key(value: str) -> tuple[int, float, str]:
+    if value == "UnknownField" or not value:
+        return (2, float("inf"), value)
+    numbers = extract_numbers(value)
+    if numbers:
+        return (0, numbers[0], value)
+    return (1, float("inf"), value)
+
+
+def ordered_field_strength_values(series: pd.Series) -> list[str]:
+    values = [clean_text(value) for value in series.dropna()]
+    value_set = set(values)
+    known = sorted(
+        [value for value in value_set if value and value != "UnknownField"],
+        key=field_strength_sort_key,
+    )
+    if "" in value_set:
+        known.append("")
+    if "UnknownField" in value_set:
+        known.append("UnknownField")
+    return known
+
+
 def ordered_analysis_groups(df: pd.DataFrame) -> list[str]:
     if df.empty or "image_condition" not in df or "dimensionality" not in df:
         return []
@@ -1183,21 +1230,32 @@ def ordered_analysis_groups(df: pd.DataFrame) -> list[str]:
         planes = pd.Series([""] * len(df), index=df.index)
     else:
         planes = df["scan_plane"]
+    if "field_strength_label" not in df:
+        field_strengths = pd.Series([""] * len(df), index=df.index)
+    else:
+        field_strengths = df["field_strength_label"]
     present = set(
-        format_analysis_group(condition, dimensionality, plane)
-        for condition, dimensionality, plane in zip(
+        format_analysis_group(condition, dimensionality, plane, field_strength)
+        for condition, dimensionality, plane, field_strength in zip(
             df["image_condition"],
             df["dimensionality"],
             planes,
+            field_strengths,
         )
     )
     ordered = []
     for condition in ordered_condition_values(df["image_condition"]):
         for dimensionality in ordered_dimension_values(df["dimensionality"]):
             for plane in ordered_plane_values(planes):
-                group = format_analysis_group(condition, dimensionality, plane)
-                if group in present:
-                    ordered.append(group)
+                for field_strength in ordered_field_strength_values(field_strengths):
+                    group = format_analysis_group(
+                        condition,
+                        dimensionality,
+                        plane,
+                        field_strength,
+                    )
+                    if group in present:
+                        ordered.append(group)
     extra = sorted(present - set(ordered))
     return ordered + extra
 
@@ -1210,12 +1268,15 @@ def add_analysis_filter(
     out = df.copy()
     if "scan_plane" not in out:
         out["scan_plane"] = "Unknown"
+    if "field_strength_label" not in out:
+        out["field_strength_label"] = "UnknownField"
     out["analysis_group"] = [
-        format_analysis_group(condition, dimensionality, plane)
-        for condition, dimensionality, plane in zip(
+        format_analysis_group(condition, dimensionality, plane, field_strength)
+        for condition, dimensionality, plane, field_strength in zip(
             out["image_condition"],
             out["dimensionality"],
             out["scan_plane"],
+            out["field_strength_label"],
         )
     ]
 
@@ -1286,7 +1347,13 @@ def make_counts(df: pd.DataFrame) -> pd.DataFrame:
         df = add_analysis_filter(df, None)
     counts = (
         df.groupby(
-            ["image_condition", "dimensionality", "scan_plane", "analysis_group"],
+            [
+                "image_condition",
+                "dimensionality",
+                "scan_plane",
+                "field_strength_label",
+                "analysis_group",
+            ],
             dropna=False,
         )
         .size()
@@ -1316,9 +1383,15 @@ def make_metric_stats(df: pd.DataFrame) -> pd.DataFrame:
     if "analysis_group" not in df:
         df = add_analysis_filter(df, None)
     rows = []
-    group_cols = ["image_condition", "dimensionality", "scan_plane", "analysis_group"]
+    group_cols = [
+        "image_condition",
+        "dimensionality",
+        "scan_plane",
+        "field_strength_label",
+        "analysis_group",
+    ]
     for group_values, group in df.groupby(group_cols, dropna=False):
-        condition, dimensionality, scan_plane, analysis_group = group_values
+        condition, dimensionality, scan_plane, field_strength, analysis_group = group_values
         total = len(group)
         for metric in NUMERIC_METRICS:
             if metric not in group:
@@ -1328,6 +1401,7 @@ def make_metric_stats(df: pd.DataFrame) -> pd.DataFrame:
                 "image_condition": condition,
                 "dimensionality": dimensionality,
                 "scan_plane": scan_plane,
+                "field_strength_label": field_strength,
                 "analysis_group": analysis_group,
                 "metric": metric,
                 "series_count": total,
@@ -1395,9 +1469,21 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
         "diffusion_b_value": 1,
     }
     rows = []
-    group_cols = ["image_condition", "dimensionality", "scan_plane", "analysis_group"]
+    group_cols = [
+        "image_condition",
+        "dimensionality",
+        "scan_plane",
+        "field_strength_label",
+        "analysis_group",
+    ]
 
-    for (condition, dimensionality, scan_plane, analysis_group), group in df.groupby(group_cols, dropna=False):
+    for (
+        condition,
+        dimensionality,
+        scan_plane,
+        field_strength,
+        analysis_group,
+    ), group in df.groupby(group_cols, dropna=False):
         group_total = len(group)
         for metric, decimals in value_specs.items():
             if metric not in group:
@@ -1413,6 +1499,7 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
                         "image_condition": condition,
                         "dimensionality": dimensionality,
                         "scan_plane": scan_plane,
+                        "field_strength_label": field_strength,
                         "analysis_group": analysis_group,
                         "metric": metric,
                         "value": value,
@@ -1473,8 +1560,20 @@ def make_condition_dimension_summary(df: pd.DataFrame) -> pd.DataFrame:
     }
 
     rows = []
-    group_cols = ["image_condition", "dimensionality", "scan_plane", "analysis_group"]
-    for (condition, dimensionality, scan_plane, analysis_group), group in df.groupby(
+    group_cols = [
+        "image_condition",
+        "dimensionality",
+        "scan_plane",
+        "field_strength_label",
+        "analysis_group",
+    ]
+    for (
+        condition,
+        dimensionality,
+        scan_plane,
+        field_strength,
+        analysis_group,
+    ), group in df.groupby(
         group_cols,
         dropna=False,
     ):
@@ -1482,6 +1581,7 @@ def make_condition_dimension_summary(df: pd.DataFrame) -> pd.DataFrame:
             "image_condition": condition,
             "dimensionality": dimensionality,
             "scan_plane": scan_plane,
+            "field_strength_label": field_strength,
             "analysis_group": analysis_group,
             "series_count": len(group),
         }
@@ -1522,6 +1622,7 @@ def make_slice_thickness_spacing_counts(df: pd.DataFrame) -> pd.DataFrame:
                 "image_condition",
                 "dimensionality",
                 "scan_plane",
+                "field_strength_label",
                 "analysis_group",
                 "slice_thickness_mm",
                 "slice_spacing_mm",
@@ -1555,6 +1656,7 @@ def make_slice_thickness_spacing_counts(df: pd.DataFrame) -> pd.DataFrame:
                 "image_condition",
                 "dimensionality",
                 "scan_plane",
+                "field_strength_label",
                 "analysis_group",
                 "slice_thickness_mm",
                 "slice_spacing_mm",
@@ -1673,8 +1775,8 @@ def save_counts_plot(counts: pd.DataFrame, figures_dir: Path) -> Path | None:
             legend=False,
             figsize=(max(10, 0.65 * len(plot_df) + 3), 5.8),
         ).axes
-    ax.set_title("Series count by condition and dimensionality")
-    ax.set_xlabel("Condition (dimensionality)")
+    ax.set_title("Series count by condition, dimensionality, plane, and field strength")
+    ax.set_xlabel("Condition (dimensionality, plane, field strength)")
     ax.set_ylabel("Series count")
     ax.tick_params(axis="x", rotation=45)
     plt.tight_layout()
@@ -1692,10 +1794,19 @@ def save_metric_boxplot(
 ) -> Path | None:
     if "analysis_group" not in df:
         df = add_analysis_filter(df, None)
+    if "field_strength_label" not in df:
+        df = df.copy()
+        df["field_strength_label"] = "UnknownField"
     values = pd.to_numeric(df.get(metric), errors="coerce")
     plot_df = df.loc[
         values.notna(),
-        ["image_condition", "dimensionality", "scan_plane", "analysis_group"],
+        [
+            "image_condition",
+            "dimensionality",
+            "scan_plane",
+            "field_strength_label",
+            "analysis_group",
+        ],
     ].copy()
     plot_df[metric] = values[values.notna()]
     if not include_other:
@@ -1738,7 +1849,7 @@ def save_metric_boxplot(
         )
         plt.suptitle("")
     ax.set_title(label)
-    ax.set_xlabel("Condition (dimensionality)")
+    ax.set_xlabel("Condition (dimensionality, plane, field strength)")
     ax.set_ylabel(label)
     ax.tick_params(axis="x", rotation=45)
     plt.tight_layout()
@@ -1747,132 +1858,294 @@ def save_metric_boxplot(
     return path
 
 
-def save_scatter_plot(df: pd.DataFrame, figures_dir: Path, include_other: bool) -> Path | None:
+def save_slice_thickness_spacing_bubble_plots(
+    df: pd.DataFrame,
+    figures_dir: Path,
+    include_other: bool,
+) -> list[Path]:
     if "analysis_group" not in df:
         df = add_analysis_filter(df, None)
     required = ["slice_thickness_mm", "slice_spacing_mm"]
     if any(col not in df for col in required):
-        return None
+        return []
+    if "scan_plane" not in df:
+        df = df.copy()
+        df["scan_plane"] = "Unknown"
+    if "field_strength_label" not in df:
+        df = df.copy()
+        df["field_strength_label"] = "UnknownField"
+
     plot_df = df.copy()
     plot_df["slice_thickness_mm"] = pd.to_numeric(
         plot_df["slice_thickness_mm"], errors="coerce"
-    )
+    ).round(3)
     plot_df["slice_spacing_mm"] = pd.to_numeric(
         plot_df["slice_spacing_mm"], errors="coerce"
-    )
+    ).round(3)
     plot_df = plot_df.dropna(subset=required)
     if not include_other:
         plot_df = plot_df[plot_df["image_condition"] != "Other"]
     if plot_df.empty:
-        return None
+        return []
 
     figures_dir.mkdir(parents=True, exist_ok=True)
-    path = figures_dir / "scatter_slice_thickness_vs_spacing.png"
-    group_order = ordered_analysis_groups(plot_df)
-    plt.figure(figsize=(9.5, 6.4))
-    if sns is not None:
-        ax = sns.scatterplot(
-            data=plot_df,
-            x="slice_thickness_mm",
-            y="slice_spacing_mm",
-            hue="analysis_group",
-            hue_order=group_order,
-            alpha=0.78,
-            s=52,
-        )
-    else:
-        ax = plt.gca()
-        for condition, group in plot_df.groupby("analysis_group"):
-            ax.scatter(
-                group["slice_thickness_mm"],
-                group["slice_spacing_mm"],
-                label=condition,
-                alpha=0.78,
+    paths: list[Path] = []
+    split_cols = ["field_strength_label", "scan_plane", "dimensionality"]
+    split_df = plot_df[split_cols].drop_duplicates()
+    split_df["field_strength_label"] = pd.Categorical(
+        split_df["field_strength_label"],
+        categories=ordered_field_strength_values(plot_df["field_strength_label"]),
+        ordered=True,
+    )
+    split_df["scan_plane"] = pd.Categorical(
+        split_df["scan_plane"],
+        categories=ordered_plane_values(plot_df["scan_plane"]),
+        ordered=True,
+    )
+    split_df["dimensionality"] = pd.Categorical(
+        split_df["dimensionality"],
+        categories=ordered_dimension_values(plot_df["dimensionality"]),
+        ordered=True,
+    )
+    split_df = split_df.sort_values(split_cols)
+
+    for _, split_values in split_df.iterrows():
+        field_strength = clean_text(split_values["field_strength_label"]) or "UnknownField"
+        scan_plane = clean_text(split_values["scan_plane"]) or "Unknown"
+        dimensionality = clean_text(split_values["dimensionality"]) or "Unknown"
+        subset = plot_df[
+            (plot_df["field_strength_label"] == field_strength)
+            & (plot_df["scan_plane"] == scan_plane)
+            & (plot_df["dimensionality"] == dimensionality)
+        ]
+        if subset.empty:
+            continue
+
+        counts = (
+            subset.groupby(
+                ["image_condition", "slice_thickness_mm", "slice_spacing_mm"],
+                dropna=False,
             )
-    ax.set_title("Slice thickness vs slice spacing")
-    ax.set_xlabel("Slice thickness (mm)")
-    ax.set_ylabel("Slice spacing (mm)")
-    ax.legend(loc="best", fontsize="small")
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
-    return path
+            .size()
+            .reset_index(name="series_count")
+        )
+        if counts.empty:
+            continue
+
+        condition_order = ordered_condition_values(counts["image_condition"])
+        n_conditions = len(condition_order)
+        n_cols = min(3, max(n_conditions, 1))
+        n_rows = int(math.ceil(n_conditions / n_cols))
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(max(8, 3.2 * n_cols), max(4.2, 3.0 * n_rows)),
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        max_count = max(int(counts["series_count"].max()), 1)
+        x_min = float(counts["slice_thickness_mm"].min())
+        x_max = float(counts["slice_thickness_mm"].max())
+        y_min = float(counts["slice_spacing_mm"].min())
+        y_max = float(counts["slice_spacing_mm"].max())
+        x_margin = max((x_max - x_min) * 0.08, 0.15)
+        y_margin = max((y_max - y_min) * 0.08, 0.15)
+        if sns is not None:
+            colors = sns.color_palette("tab10", n_colors=max(n_conditions, 1))
+        else:
+            colors = plt.cm.tab10(np.linspace(0, 1, max(n_conditions, 1)))
+
+        for condition_index, condition in enumerate(condition_order):
+            ax = axes[condition_index // n_cols][condition_index % n_cols]
+            condition_counts = counts[counts["image_condition"] == condition]
+            sizes = 90 + 620 * (
+                condition_counts["series_count"] / max_count
+            ).pow(0.72)
+            ax.scatter(
+                condition_counts["slice_thickness_mm"],
+                condition_counts["slice_spacing_mm"],
+                s=sizes,
+                color=colors[condition_index],
+                alpha=0.58,
+                edgecolors="black",
+                linewidths=0.5,
+            )
+            for _, row in condition_counts.iterrows():
+                ax.text(
+                    row["slice_thickness_mm"],
+                    row["slice_spacing_mm"],
+                    str(int(row["series_count"])),
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="black",
+                )
+            ax.set_title(clean_text(condition) or "Other")
+            ax.set_xlim(x_min - x_margin, x_max + x_margin)
+            ax.set_ylim(y_min - y_margin, y_max + y_margin)
+            ax.grid(True, alpha=0.28)
+
+        for empty_index in range(n_conditions, n_rows * n_cols):
+            axes[empty_index // n_cols][empty_index % n_cols].axis("off")
+
+        fig.suptitle(
+            f"Slice thickness vs spacing counts: "
+            f"{field_strength}, {scan_plane}, {dimensionality}"
+        )
+        fig.supxlabel("Slice thickness (mm)")
+        fig.supylabel("Slice spacing (mm)")
+        path = figures_dir / (
+            "bubble_slice_thickness_vs_spacing"
+            f"_field_{safe_filename(field_strength)}"
+            f"_plane_{safe_filename(scan_plane)}"
+            f"_dim_{safe_filename(dimensionality)}.png"
+        )
+        plt.tight_layout()
+        plt.savefig(path)
+        plt.close(fig)
+        paths.append(path)
+
+    return paths
 
 
-def save_categorical_count_heatmap(
+def save_categorical_count_heatmaps(
     df: pd.DataFrame,
     metric: str,
     label: str,
     figures_dir: Path,
     include_other: bool,
     max_values: int = 12,
-) -> Path | None:
+) -> list[Path]:
     if "analysis_group" not in df:
         df = add_analysis_filter(df, None)
     if metric not in df:
-        return None
+        return []
 
     if "scan_plane" not in df:
         df = df.copy()
         df["scan_plane"] = "Unknown"
+    if "field_strength_label" not in df:
+        df = df.copy()
+        df["field_strength_label"] = "UnknownField"
     plot_df = df[
-        ["image_condition", "dimensionality", "scan_plane", "analysis_group", metric]
+        [
+            "image_condition",
+            "dimensionality",
+            "scan_plane",
+            "field_strength_label",
+            "analysis_group",
+            metric,
+        ]
     ].copy()
     plot_df[metric] = plot_df[metric].map(clean_text)
     plot_df = plot_df[plot_df[metric] != ""]
     if not include_other:
         plot_df = plot_df[plot_df["image_condition"] != "Other"]
     if plot_df.empty:
-        return None
+        return []
 
     top_values_for_metric = plot_df[metric].value_counts().head(max_values).index
     plot_df = plot_df[plot_df[metric].isin(top_values_for_metric)]
-    group_order = ordered_analysis_groups(plot_df)
-    pivot = (
-        plot_df.pivot_table(
-            index="analysis_group",
-            columns=metric,
-            values="image_condition",
-            aggfunc="count",
-            fill_value=0,
-        )
-        .reindex(index=group_order, columns=top_values_for_metric, fill_value=0)
-        .astype(int)
-    )
-    if pivot.empty:
-        return None
+    if plot_df.empty:
+        return []
 
     figures_dir.mkdir(parents=True, exist_ok=True)
-    path = figures_dir / f"heatmap_{safe_filename(metric)}.png"
-    plt.figure(figsize=(max(8, 0.7 * pivot.shape[1] + 3), max(4.5, 0.45 * pivot.shape[0] + 2)))
-    if sns is not None:
-        ax = sns.heatmap(pivot, annot=True, fmt="d", cmap="Blues", cbar_kws={"label": "Series count"})
-    else:
-        ax = plt.gca()
-        image = ax.imshow(pivot.values, aspect="auto", cmap="Blues")
-        plt.colorbar(image, ax=ax, label="Series count")
-        ax.set_xticks(np.arange(pivot.shape[1]))
-        ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
-        ax.set_yticks(np.arange(pivot.shape[0]))
-        ax.set_yticklabels(pivot.index)
-        for row_index in range(pivot.shape[0]):
-            for col_index in range(pivot.shape[1]):
-                ax.text(
-                    col_index,
-                    row_index,
-                    str(pivot.iat[row_index, col_index]),
-                    ha="center",
-                    va="center",
-                    color="black",
-                    fontsize=8,
-                )
-    ax.set_title(f"{label} frequency by condition")
-    ax.set_xlabel(label)
-    ax.set_ylabel("Condition (dimensionality)")
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
-    return path
+    paths: list[Path] = []
+    split_cols = ["field_strength_label", "scan_plane", "dimensionality"]
+    split_df = plot_df[split_cols].drop_duplicates()
+    split_df["field_strength_label"] = pd.Categorical(
+        split_df["field_strength_label"],
+        categories=ordered_field_strength_values(plot_df["field_strength_label"]),
+        ordered=True,
+    )
+    split_df["scan_plane"] = pd.Categorical(
+        split_df["scan_plane"],
+        categories=ordered_plane_values(plot_df["scan_plane"]),
+        ordered=True,
+    )
+    split_df["dimensionality"] = pd.Categorical(
+        split_df["dimensionality"],
+        categories=ordered_dimension_values(plot_df["dimensionality"]),
+        ordered=True,
+    )
+    split_df = split_df.sort_values(split_cols)
+
+    for _, split_values in split_df.iterrows():
+        field_strength = clean_text(split_values["field_strength_label"]) or "UnknownField"
+        scan_plane = clean_text(split_values["scan_plane"]) or "Unknown"
+        dimensionality = clean_text(split_values["dimensionality"]) or "Unknown"
+        subset = plot_df[
+            (plot_df["field_strength_label"] == field_strength)
+            & (plot_df["scan_plane"] == scan_plane)
+            & (plot_df["dimensionality"] == dimensionality)
+        ]
+        if subset.empty:
+            continue
+
+        condition_order = ordered_condition_values(subset["image_condition"])
+        pivot = (
+            subset.pivot_table(
+                index="image_condition",
+                columns=metric,
+                values="analysis_group",
+                aggfunc="count",
+                fill_value=0,
+            )
+            .reindex(index=condition_order, columns=top_values_for_metric, fill_value=0)
+            .astype(int)
+        )
+        if pivot.empty:
+            continue
+
+        path = figures_dir / (
+            f"heatmap_{safe_filename(metric)}"
+            f"_field_{safe_filename(field_strength)}"
+            f"_plane_{safe_filename(scan_plane)}"
+            f"_dim_{safe_filename(dimensionality)}.png"
+        )
+        plt.figure(
+            figsize=(
+                max(8, 0.7 * pivot.shape[1] + 3),
+                max(4.2, 0.45 * pivot.shape[0] + 2),
+            )
+        )
+        if sns is not None:
+            ax = sns.heatmap(
+                pivot,
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                cbar_kws={"label": "Series count"},
+            )
+        else:
+            ax = plt.gca()
+            image = ax.imshow(pivot.values, aspect="auto", cmap="Blues")
+            plt.colorbar(image, ax=ax, label="Series count")
+            ax.set_xticks(np.arange(pivot.shape[1]))
+            ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+            ax.set_yticks(np.arange(pivot.shape[0]))
+            ax.set_yticklabels(pivot.index)
+            for row_index in range(pivot.shape[0]):
+                for col_index in range(pivot.shape[1]):
+                    ax.text(
+                        col_index,
+                        row_index,
+                        str(pivot.iat[row_index, col_index]),
+                        ha="center",
+                        va="center",
+                        color="black",
+                        fontsize=8,
+                    )
+        ax.set_title(f"{label}: {field_strength}, {scan_plane}, {dimensionality}")
+        ax.set_xlabel(label)
+        ax.set_ylabel("Condition")
+        plt.tight_layout()
+        plt.savefig(path)
+        plt.close()
+        paths.append(path)
+
+    return paths
 
 
 def make_figures(
@@ -1895,29 +2168,30 @@ def make_figures(
         if path:
             paths.append(path)
 
-    scatter_path = save_scatter_plot(df, figures_dir, include_other)
-    if scatter_path:
-        paths.append(scatter_path)
+    bubble_paths = save_slice_thickness_spacing_bubble_plots(
+        df,
+        figures_dir,
+        include_other,
+    )
+    paths.extend(bubble_paths)
 
-    matrix_path = save_categorical_count_heatmap(
+    matrix_paths = save_categorical_count_heatmaps(
         df,
         "matrix_size",
         "Matrix size",
         figures_dir,
         include_other,
     )
-    if matrix_path:
-        paths.append(matrix_path)
+    paths.extend(matrix_paths)
 
-    thickness_spacing_path = save_categorical_count_heatmap(
+    thickness_spacing_paths = save_categorical_count_heatmaps(
         df,
         "slice_thickness_spacing_mm",
         "Slice thickness x spacing (mm)",
         figures_dir,
         True,
     )
-    if thickness_spacing_path:
-        paths.append(thickness_spacing_path)
+    paths.extend(thickness_spacing_paths)
 
     return paths
 
@@ -1972,6 +2246,14 @@ def make_report(
         if "scan_plane" in analysis_df
         else pd.DataFrame(columns=["scan_plane", "series_count"])
     )
+    field_strength_counts = (
+        analysis_df["field_strength_label"]
+        .value_counts(dropna=False)
+        .rename_axis("field_strength_label")
+        .reset_index(name="series_count")
+        if "field_strength_label" in analysis_df
+        else pd.DataFrame(columns=["field_strength_label", "series_count"])
+    )
 
     missing = []
     for metric in NUMERIC_METRICS:
@@ -2016,6 +2298,7 @@ def make_report(
                 "image_condition",
                 "dimensionality",
                 "scan_plane",
+                "field_strength_label",
                 "analysis_group",
                 "metric",
                 "valid_count",
@@ -2029,6 +2312,7 @@ def make_report(
     summary_display_columns = [
         "analysis_group",
         "scan_plane",
+        "field_strength_label",
         "series_count",
         "slice_thickness_mm",
         "space_between_slices_mm",
@@ -2106,7 +2390,11 @@ CSV encoding: `{encoding}`
 
 {markdown_table(plane_counts)}
 
-## Condition x dimensionality x plane counts
+## Field strength counts
+
+{markdown_table(field_strength_counts)}
+
+## Condition x dimensionality x plane x field strength counts
 
 {markdown_table(counts)}
 
@@ -2138,13 +2426,18 @@ CSV encoding: `{encoding}`
 - Scan plane labels are based mainly on ImageOrientationPatient. PatientOrientation
   and AX/SAG/COR text are used as fallbacks; if these tags are absent, scan_plane
   will often be `Unknown`.
+- Magnetic field strength groups are based on MagneticFieldStrength and formatted
+  as labels such as `1.5T` or `3T`; missing values are grouped as `UnknownField`.
 - Review `condition_reason` and `dimensionality_reason` in
   `series_with_derived_columns.csv` for questionable series.
 - Rows with `analysis_excluded=True` are kept in `series_with_derived_columns.csv`
   but are not used for counts, statistics, or figures.
-- `figures/heatmap_slice_thickness_spacing_mm.png` is generated only when at
-  least one included row has both SliceThickness and SpacingBetweenSlices. This
-  heatmap includes `Other` groups because it is intended as a geometry QC view.
+- Slice thickness vs spacing is shown as split bubble plots. Each point is one
+  unique thickness/spacing pair, the label and bubble size show the series count,
+  and panels are separated by condition.
+- Heatmaps for matrix size and slice thickness x spacing are split into separate
+  files by field strength, scan plane, and 2D/3D label. Slice thickness x spacing
+  heatmaps include `Other` groups because they are intended as geometry QC views.
 - If many rows are `Other` or `Unknown`, add more descriptive DICOM tag columns to
   the input CSV, especially SequenceName, ScanningSequence, SequenceVariant,
   ScanOptions, ImageType, AcquisitionContrast, DiffusionBValue, EchoTrainLength,
