@@ -66,6 +66,7 @@ CONDITION_ORDER = [
 DIMENSION_ORDER = ["2D", "3D", "Unknown"]
 
 DEFAULT_EXCLUDE_SLICE_MM = 10.0
+DEFAULT_EXCLUDE_SLICES_LE = 7
 
 COLUMN_ALIASES = {
     "series_description": [
@@ -347,6 +348,8 @@ NUMERIC_METRICS = [
     "pixel_spacing_col_mm",
     "matrix_rows",
     "matrix_columns",
+    "image_rows",
+    "image_columns",
     "number_of_slices",
     "repetition_time_ms",
     "echo_time_ms",
@@ -388,6 +391,8 @@ SUMMARY_METRICS = [
     ("fov_col_mm", "fov_col_mm"),
     ("matrix_rows", "matrix_rows"),
     ("matrix_columns", "matrix_columns"),
+    ("image_rows", "image_rows"),
+    ("image_columns", "image_columns"),
     ("number_of_slices", "number_of_slices"),
     ("repetition_time_ms", "tr_ms"),
     ("echo_time_ms", "te_ms"),
@@ -881,21 +886,37 @@ def add_derived_columns(
         out["pixel_spacing_row_mm"] = np.nan
         out["pixel_spacing_col_mm"] = np.nan
 
-    out["matrix_rows"] = series_from_column(out, columns["rows"])
-    out["matrix_columns"] = series_from_column(out, columns["columns"])
+    out["image_rows"] = series_from_column(out, columns["rows"])
+    out["image_columns"] = series_from_column(out, columns["columns"])
+    out["matrix_rows"] = out["image_rows"].copy()
+    out["matrix_columns"] = out["image_columns"].copy()
+    out["matrix_source"] = np.where(
+        out["matrix_rows"].notna() & out["matrix_columns"].notna(),
+        "Rows/Columns",
+        "",
+    )
 
     if columns["acquisition_matrix"] is not None:
         acq_pairs = out[columns["acquisition_matrix"]].map(acquisition_matrix_numbers)
         acq_rows = pd.Series([item[0] for item in acq_pairs], index=out.index)
         acq_cols = pd.Series([item[1] for item in acq_pairs], index=out.index)
-        out["matrix_rows"] = out["matrix_rows"].fillna(acq_rows)
-        out["matrix_columns"] = out["matrix_columns"].fillna(acq_cols)
+        has_acq_matrix = acq_rows.notna() & acq_cols.notna()
+        out["acquisition_matrix_rows"] = acq_rows
+        out["acquisition_matrix_columns"] = acq_cols
+        out.loc[has_acq_matrix, "matrix_rows"] = acq_rows[has_acq_matrix]
+        out.loc[has_acq_matrix, "matrix_columns"] = acq_cols[has_acq_matrix]
+        out.loc[has_acq_matrix, "matrix_source"] = "AcquisitionMatrix"
+    else:
+        out["acquisition_matrix_rows"] = np.nan
+        out["acquisition_matrix_columns"] = np.nan
 
     out["slice_gap_mm"] = out["slice_spacing_mm"] - out["slice_thickness_mm"]
     out.loc[out["slice_gap_mm"].abs() < 1e-6, "slice_gap_mm"] = 0.0
 
-    out["fov_row_mm"] = out["matrix_rows"] * out["pixel_spacing_row_mm"]
-    out["fov_col_mm"] = out["matrix_columns"] * out["pixel_spacing_col_mm"]
+    fov_rows = out["image_rows"].fillna(out["matrix_rows"])
+    fov_columns = out["image_columns"].fillna(out["matrix_columns"])
+    out["fov_row_mm"] = fov_rows * out["pixel_spacing_row_mm"]
+    out["fov_col_mm"] = fov_columns * out["pixel_spacing_col_mm"]
     out["voxel_volume_mm3"] = (
         out["pixel_spacing_row_mm"]
         * out["pixel_spacing_col_mm"]
@@ -906,6 +927,17 @@ def add_derived_columns(
         format_matrix_size(rows, cols)
         for rows, cols in zip(out["matrix_rows"], out["matrix_columns"])
     ]
+    out["image_matrix_size"] = [
+        format_matrix_size(rows, cols)
+        for rows, cols in zip(out["image_rows"], out["image_columns"])
+    ]
+    out["acquisition_matrix_size"] = [
+        format_matrix_size(rows, cols)
+        for rows, cols in zip(
+            out["acquisition_matrix_rows"],
+            out["acquisition_matrix_columns"],
+        )
+    ]
     out["pixel_spacing_mm"] = [
         format_pair(row, col)
         for row, col in zip(out["pixel_spacing_row_mm"], out["pixel_spacing_col_mm"])
@@ -913,6 +945,10 @@ def add_derived_columns(
     out["fov_mm"] = [
         format_pair(row, col, decimals=1)
         for row, col in zip(out["fov_row_mm"], out["fov_col_mm"])
+    ]
+    out["slice_thickness_spacing_mm"] = [
+        format_pair(thickness, spacing, decimals=2)
+        for thickness, spacing in zip(out["slice_thickness_mm"], out["slice_spacing_mm"])
     ]
 
     return out
@@ -1007,36 +1043,74 @@ def ordered_analysis_groups(df: pd.DataFrame) -> list[str]:
     return ordered + extra
 
 
-def add_analysis_filter(df: pd.DataFrame, max_slice_mm: float | None) -> pd.DataFrame:
+def add_analysis_filter(
+    df: pd.DataFrame,
+    max_slice_mm: float | None,
+    exclude_slices_le: int | None = None,
+) -> pd.DataFrame:
     out = df.copy()
     out["analysis_group"] = [
         format_analysis_group(condition, dimensionality)
         for condition, dimensionality in zip(out["image_condition"], out["dimensionality"])
     ]
 
-    if max_slice_mm is None or max_slice_mm <= 0:
+    if (max_slice_mm is None or max_slice_mm <= 0) and (
+        exclude_slices_le is None or exclude_slices_le <= 0
+    ):
         out["analysis_excluded"] = False
         out["analysis_exclusion_reason"] = ""
         return out
 
-    thickness = pd.to_numeric(out.get("slice_thickness_mm"), errors="coerce")
-    spacing = pd.to_numeric(out.get("slice_spacing_mm"), errors="coerce")
-    thick_excluded = thickness.ge(max_slice_mm).fillna(False)
-    spacing_excluded = spacing.ge(max_slice_mm).fillna(False)
-    out["analysis_excluded"] = thick_excluded | spacing_excluded
+    thickness = pd.to_numeric(
+        out["slice_thickness_mm"]
+        if "slice_thickness_mm" in out
+        else pd.Series(np.nan, index=out.index),
+        errors="coerce",
+    )
+    spacing = pd.to_numeric(
+        out["slice_spacing_mm"]
+        if "slice_spacing_mm" in out
+        else pd.Series(np.nan, index=out.index),
+        errors="coerce",
+    )
+    number_of_slices = pd.to_numeric(
+        out["number_of_slices"]
+        if "number_of_slices" in out
+        else pd.Series(np.nan, index=out.index),
+        errors="coerce",
+    )
+    if max_slice_mm is None or max_slice_mm <= 0:
+        thick_excluded = pd.Series(False, index=out.index)
+        spacing_excluded = pd.Series(False, index=out.index)
+    else:
+        thick_excluded = thickness.ge(max_slice_mm).fillna(False)
+        spacing_excluded = spacing.ge(max_slice_mm).fillna(False)
+    if exclude_slices_le is None or exclude_slices_le <= 0:
+        few_slices_excluded = pd.Series(False, index=out.index)
+    else:
+        few_slices_excluded = number_of_slices.le(exclude_slices_le).fillna(False)
+    out["analysis_excluded"] = (
+        thick_excluded | spacing_excluded | few_slices_excluded
+    )
 
     reasons = []
-    for thick, space, thick_value, space_value in zip(
+    for thick, space, few_slices, thick_value, space_value, slice_count in zip(
         thick_excluded,
         spacing_excluded,
+        few_slices_excluded,
         thickness,
         spacing,
+        number_of_slices,
     ):
         row_reasons = []
         if thick:
             row_reasons.append(f"slice_thickness_mm={thick_value:g} >= {max_slice_mm:g}")
         if space:
             row_reasons.append(f"slice_spacing_mm={space_value:g} >= {max_slice_mm:g}")
+        if few_slices:
+            row_reasons.append(
+                f"number_of_slices={slice_count:g} <= {exclude_slices_le:g}"
+            )
         reasons.append("; ".join(row_reasons))
     out["analysis_exclusion_reason"] = reasons
     return out
@@ -1128,12 +1202,16 @@ def make_value_counts(df: pd.DataFrame) -> pd.DataFrame:
     value_specs = {
         "slice_thickness_mm": 3,
         "slice_spacing_mm": 3,
+        "slice_thickness_spacing_mm": None,
         "slice_gap_mm": 3,
         "pixel_spacing_row_mm": 3,
         "pixel_spacing_col_mm": 3,
         "matrix_rows": 0,
         "matrix_columns": 0,
         "matrix_size": None,
+        "matrix_source": None,
+        "image_matrix_size": None,
+        "acquisition_matrix_size": None,
         "fov_row_mm": 1,
         "fov_col_mm": 1,
         "fov_mm": None,
@@ -1245,10 +1323,14 @@ def make_condition_dimension_summary(df: pd.DataFrame) -> pd.DataFrame:
             row[f"{output_name}_n"] = numeric_valid_count(group[metric])
 
         row["common_matrix_size"] = top_text_values(group.get("matrix_size", pd.Series(dtype=str)))
+        row["common_slice_thickness_spacing_mm"] = top_text_values(
+            group.get("slice_thickness_spacing_mm", pd.Series(dtype=str))
+        )
         row["common_fov_mm"] = top_text_values(group.get("fov_mm", pd.Series(dtype=str)))
         row["common_pixel_spacing_mm"] = top_text_values(
             group.get("pixel_spacing_mm", pd.Series(dtype=str))
         )
+        row["matrix_source"] = top_text_values(group.get("matrix_source", pd.Series(dtype=str)))
         rows.append(row)
 
     summary = pd.DataFrame(rows)
@@ -1257,6 +1339,69 @@ def make_condition_dimension_summary(df: pd.DataFrame) -> pd.DataFrame:
     group_order = {group: idx for idx, group in enumerate(ordered_analysis_groups(df))}
     summary["_order"] = summary["analysis_group"].map(group_order).fillna(len(group_order))
     return summary.sort_values("_order").drop(columns="_order")
+
+
+def make_slice_thickness_spacing_counts(df: pd.DataFrame) -> pd.DataFrame:
+    if "analysis_group" not in df:
+        df = add_analysis_filter(df, None)
+    required = ["slice_thickness_mm", "slice_spacing_mm"]
+    if any(column not in df for column in required):
+        return pd.DataFrame(
+            columns=[
+                "image_condition",
+                "dimensionality",
+                "analysis_group",
+                "slice_thickness_mm",
+                "slice_spacing_mm",
+                "slice_thickness_spacing_mm",
+                "series_count",
+                "group_percent",
+            ]
+        )
+
+    work = df.copy()
+    work["slice_thickness_mm"] = pd.to_numeric(
+        work["slice_thickness_mm"],
+        errors="coerce",
+    ).round(3)
+    work["slice_spacing_mm"] = pd.to_numeric(
+        work["slice_spacing_mm"],
+        errors="coerce",
+    ).round(3)
+    work = work.dropna(subset=required)
+    if work.empty:
+        return pd.DataFrame()
+
+    work["slice_thickness_spacing_mm"] = [
+        format_pair(thickness, spacing, decimals=2)
+        for thickness, spacing in zip(work["slice_thickness_mm"], work["slice_spacing_mm"])
+    ]
+    group_total = work.groupby("analysis_group", dropna=False).size()
+    counts = (
+        work.groupby(
+            [
+                "image_condition",
+                "dimensionality",
+                "analysis_group",
+                "slice_thickness_mm",
+                "slice_spacing_mm",
+                "slice_thickness_spacing_mm",
+            ],
+            dropna=False,
+        )
+        .size()
+        .reset_index(name="series_count")
+    )
+    counts["group_percent"] = [
+        count / max(group_total.get(group, 0), 1) * 100.0
+        for group, count in zip(counts["analysis_group"], counts["series_count"])
+    ]
+    group_order = {group: idx for idx, group in enumerate(ordered_analysis_groups(work))}
+    counts["_order"] = counts["analysis_group"].map(group_order).fillna(len(group_order))
+    return counts.sort_values(
+        ["_order", "series_count", "slice_thickness_mm", "slice_spacing_mm"],
+        ascending=[True, False, True, True],
+    ).drop(columns="_order")
 
 
 def write_csv(df: pd.DataFrame, path: Path) -> None:
@@ -1586,6 +1731,16 @@ def make_figures(
     if matrix_path:
         paths.append(matrix_path)
 
+    thickness_spacing_path = save_categorical_count_heatmap(
+        df,
+        "slice_thickness_spacing_mm",
+        "Slice thickness x spacing (mm)",
+        figures_dir,
+        include_other,
+    )
+    if thickness_spacing_path:
+        paths.append(thickness_spacing_path)
+
     return paths
 
 
@@ -1611,6 +1766,7 @@ def make_report(
     figures: list[Path],
     encoding: str,
     max_slice_mm: float | None,
+    exclude_slices_le: int | None,
 ) -> str:
     detected_rows = [
         {"logical_field": key, "csv_column": value or ""}
@@ -1688,9 +1844,11 @@ def make_report(
         "series_count",
         "slice_thickness_mm",
         "space_between_slices_mm",
+        "common_slice_thickness_spacing_mm",
         "fov_row_mm",
         "fov_col_mm",
         "common_matrix_size",
+        "matrix_source",
         "common_fov_mm",
         "common_pixel_spacing_mm",
     ]
@@ -1708,6 +1866,13 @@ def make_report(
             f"Rows with SliceThickness or SpacingBetweenSlices >= {max_slice_mm:g} mm "
             "were excluded from counts, statistics, and figures."
         )
+    if exclude_slices_le is None or exclude_slices_le <= 0:
+        slice_count_exclusion_line = "No low-slice-count exclusion threshold was applied."
+    else:
+        slice_count_exclusion_line = (
+            f"Rows with NumberOfSlices <= {exclude_slices_le:g} were excluded from "
+            "counts, statistics, and figures when that tag is available."
+        )
 
     report = f"""# DICOM Tag Analysis Report
 
@@ -1723,6 +1888,8 @@ Rows excluded from analysis: {len(excluded_df)}
 
 Slice exclusion rule: {exclusion_line}
 
+Low slice-count exclusion rule: {slice_count_exclusion_line}
+
 CSV encoding: `{encoding}`
 
 ## Generated files
@@ -1732,6 +1899,7 @@ CSV encoding: `{encoding}`
 - `excluded_series_from_analysis.csv`
 - `condition_dimension_counts.csv`
 - `summary_by_condition_dimension.csv`
+- `slice_thickness_spacing_counts.csv`
 - `metric_stats_by_condition_dimension.csv`
 - `metric_value_counts_by_condition_dimension.csv`
 - `detected_columns.json`
@@ -1796,11 +1964,12 @@ def save_outputs(
     include_other_plots: bool,
     encoding: str,
     max_slice_mm: float | None,
+    exclude_slices_le: int | None,
 ) -> dict[str, Path | list[Path]]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if "analysis_excluded" not in df:
-        df = add_analysis_filter(df, max_slice_mm)
+        df = add_analysis_filter(df, max_slice_mm, exclude_slices_le)
 
     analysis_df = df[~df["analysis_excluded"]].copy()
     excluded_df = df[df["analysis_excluded"]].copy()
@@ -1809,12 +1978,14 @@ def save_outputs(
     stats = make_metric_stats(analysis_df)
     value_counts = make_value_counts(analysis_df)
     summary = make_condition_dimension_summary(analysis_df)
+    thickness_spacing_counts = make_slice_thickness_spacing_counts(analysis_df)
 
     derived_path = output_dir / "series_with_derived_columns.csv"
     included_path = output_dir / "included_series_for_analysis.csv"
     excluded_path = output_dir / "excluded_series_from_analysis.csv"
     counts_path = output_dir / "condition_dimension_counts.csv"
     summary_path = output_dir / "summary_by_condition_dimension.csv"
+    thickness_spacing_counts_path = output_dir / "slice_thickness_spacing_counts.csv"
     stats_path = output_dir / "metric_stats_by_condition_dimension.csv"
     value_counts_path = output_dir / "metric_value_counts_by_condition_dimension.csv"
     columns_path = output_dir / "detected_columns.json"
@@ -1825,6 +1996,7 @@ def save_outputs(
     write_csv(excluded_df, excluded_path)
     write_csv(counts, counts_path)
     write_csv(summary, summary_path)
+    write_csv(thickness_spacing_counts, thickness_spacing_counts_path)
     write_csv(stats, stats_path)
     write_csv(value_counts, value_counts_path)
 
@@ -1850,6 +2022,7 @@ def save_outputs(
         figures=figures,
         encoding=encoding,
         max_slice_mm=max_slice_mm,
+        exclude_slices_le=exclude_slices_le,
     )
     report_path.write_text(report, encoding="utf-8")
 
@@ -1859,6 +2032,7 @@ def save_outputs(
         "excluded": excluded_path,
         "counts": counts_path,
         "summary": summary_path,
+        "thickness_spacing_counts": thickness_spacing_counts_path,
         "stats": stats_path,
         "value_counts": value_counts_path,
         "columns": columns_path,
@@ -1913,6 +2087,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--exclude-slices-le",
+        type=int,
+        default=DEFAULT_EXCLUDE_SLICES_LE,
+        help=(
+            "Exclude rows from counts, statistics, and figures when NumberOfSlices "
+            "is less than or equal to this value. Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--infer-dim-from-geometry",
         action="store_true",
         help=(
@@ -1953,7 +2136,11 @@ def main(argv: list[str] | None = None) -> int:
         infer_dim_from_geometry=args.infer_dim_from_geometry,
         use_series_protocol_text=args.use_series_protocol_text,
     )
-    derived = add_analysis_filter(derived, args.exclude_slice_mm)
+    derived = add_analysis_filter(
+        derived,
+        args.exclude_slice_mm,
+        args.exclude_slices_le,
+    )
     outputs = save_outputs(
         input_path=input_path,
         df=derived,
@@ -1963,6 +2150,7 @@ def main(argv: list[str] | None = None) -> int:
         include_other_plots=args.include_other_plots,
         encoding=encoding,
         max_slice_mm=args.exclude_slice_mm,
+        exclude_slices_le=args.exclude_slices_le,
     )
 
     analyzed_count = int((~derived["analysis_excluded"]).sum())
@@ -1972,6 +2160,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Report: {outputs['report']}")
     print(f"Derived CSV: {outputs['derived']}")
     print(f"Summary CSV: {outputs['summary']}")
+    print(f"Thickness/spacing counts CSV: {outputs['thickness_spacing_counts']}")
     print(f"Stats CSV: {outputs['stats']}")
     if not args.no_plots:
         print(f"Figures: {len(outputs['figures'])}")
