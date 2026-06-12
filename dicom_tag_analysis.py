@@ -68,6 +68,7 @@ PLANE_ORDER = ["AX", "SAG", "COR", "Oblique", "Unknown"]
 
 DEFAULT_EXCLUDE_SLICE_MM = 10.0
 DEFAULT_EXCLUDE_SLICES_LE = 7
+DEFAULT_HIGH_QUALITY_MIN_SCORE = 70.0
 
 COLUMN_ALIASES = {
     "series_description": [
@@ -1342,6 +1343,280 @@ def add_analysis_filter(
     return out
 
 
+def numeric_row_value(row: pd.Series, key: str) -> float:
+    if key not in row:
+        return np.nan
+    try:
+        value = float(row.get(key))
+    except (TypeError, ValueError):
+        return np.nan
+    return value if np.isfinite(value) else np.nan
+
+
+def score_quality_row(row: pd.Series) -> tuple[float, str, str]:
+    score = 0.0
+    reasons: list[str] = []
+    limitations: list[str] = []
+
+    def add(points: float, reason: str) -> None:
+        nonlocal score
+        score += points
+        reasons.append(f"+{points:g} {reason}")
+
+    condition = clean_text(row.get("image_condition", "")) or "Other"
+    dimensionality = clean_text(row.get("dimensionality", "")) or "Unknown"
+    scan_plane = clean_text(row.get("scan_plane", "")) or "Unknown"
+    field_strength_label = clean_text(row.get("field_strength_label", ""))
+    excluded = bool(row.get("analysis_excluded", False))
+
+    if excluded:
+        reason = clean_text(row.get("analysis_exclusion_reason", ""))
+        limitations.append("analysis excluded" + (f": {reason}" if reason else ""))
+        return 0.0, "", "; ".join(limitations)
+    if condition in {"Localizer", "Other"}:
+        limitations.append(f"{condition} is not treated as a high-quality diagnostic candidate")
+        return 0.0, "", "; ".join(limitations)
+
+    add(10, f"recognized {condition} series")
+    if scan_plane in {"AX", "SAG", "COR"}:
+        add(3, f"recognized {scan_plane} plane")
+    elif scan_plane == "Oblique":
+        add(1, "oblique plane")
+    else:
+        limitations.append("scan plane unknown")
+
+    field_strength = numeric_row_value(row, "field_strength_t")
+    if np.isfinite(field_strength):
+        if field_strength >= 2.9:
+            add(10, f"{field_strength_label or f'{field_strength:g}T'} field strength")
+        elif field_strength >= 1.4:
+            add(7, f"{field_strength_label or f'{field_strength:g}T'} field strength")
+        else:
+            add(3, f"{field_strength:g}T field strength")
+    else:
+        limitations.append("field strength missing")
+
+    if dimensionality == "3D":
+        add(8, "3D acquisition")
+    elif dimensionality == "2D":
+        add(4, "2D diagnostic acquisition")
+    else:
+        limitations.append("2D/3D label unknown")
+
+    thickness = numeric_row_value(row, "slice_thickness_mm")
+    spacing = numeric_row_value(row, "slice_spacing_mm")
+    gap = numeric_row_value(row, "slice_gap_mm")
+    pixel_row = numeric_row_value(row, "pixel_spacing_row_mm")
+    pixel_col = numeric_row_value(row, "pixel_spacing_col_mm")
+    voxel_volume = numeric_row_value(row, "voxel_volume_mm3")
+    matrix_rows = numeric_row_value(row, "matrix_rows")
+    matrix_cols = numeric_row_value(row, "matrix_columns")
+    slices = numeric_row_value(row, "number_of_slices")
+    fov_row = numeric_row_value(row, "fov_row_mm")
+    fov_col = numeric_row_value(row, "fov_col_mm")
+
+    if np.isfinite(thickness):
+        if dimensionality == "3D":
+            if thickness <= 1.2:
+                add(16, f"thin 3D slices ({thickness:g} mm)")
+            elif thickness <= 1.6:
+                add(13, f"thin 3D slices ({thickness:g} mm)")
+            elif thickness <= 2.0:
+                add(8, f"moderate 3D slice thickness ({thickness:g} mm)")
+            else:
+                add(2, f"thicker 3D slices ({thickness:g} mm)")
+        else:
+            if thickness <= 4.0:
+                add(12, f"thin 2D slices ({thickness:g} mm)")
+            elif thickness <= 5.0:
+                add(10, f"standard diagnostic slice thickness ({thickness:g} mm)")
+            elif thickness <= 6.0:
+                add(6, f"acceptable slice thickness ({thickness:g} mm)")
+            else:
+                add(2, f"thicker slices ({thickness:g} mm)")
+    else:
+        limitations.append("slice thickness missing")
+
+    if np.isfinite(spacing):
+        if spacing <= 1.2:
+            add(12, f"small slice spacing ({spacing:g} mm)")
+        elif spacing <= 1.8:
+            add(10, f"small slice spacing ({spacing:g} mm)")
+        elif spacing <= 5.0:
+            add(8, f"diagnostic slice spacing ({spacing:g} mm)")
+        elif spacing <= 6.0:
+            add(5, f"acceptable slice spacing ({spacing:g} mm)")
+        else:
+            limitations.append(f"large slice spacing ({spacing:g} mm)")
+    else:
+        limitations.append("slice spacing missing")
+
+    if np.isfinite(gap):
+        if abs(gap) <= 0.1:
+            add(10, "contiguous slices")
+        elif gap <= 0.5:
+            add(7, f"small slice gap ({gap:g} mm)")
+        elif gap <= 1.0:
+            add(4, f"moderate slice gap ({gap:g} mm)")
+        else:
+            limitations.append(f"large slice gap ({gap:g} mm)")
+    else:
+        limitations.append("slice gap unavailable")
+
+    if np.isfinite(pixel_row) and np.isfinite(pixel_col):
+        max_pixel = max(pixel_row, pixel_col)
+        if max_pixel <= 0.8:
+            add(14, f"fine in-plane resolution ({pixel_row:g}x{pixel_col:g} mm)")
+        elif max_pixel <= 1.0:
+            add(12, f"good in-plane resolution ({pixel_row:g}x{pixel_col:g} mm)")
+        elif max_pixel <= 1.2:
+            add(8, f"moderate in-plane resolution ({pixel_row:g}x{pixel_col:g} mm)")
+        elif max_pixel <= 1.5:
+            add(4, f"coarser in-plane resolution ({pixel_row:g}x{pixel_col:g} mm)")
+        else:
+            limitations.append(f"coarse in-plane resolution ({pixel_row:g}x{pixel_col:g} mm)")
+    else:
+        limitations.append("pixel spacing missing")
+
+    if np.isfinite(voxel_volume):
+        if voxel_volume <= 1.0:
+            add(12, f"near-isotropic small voxel volume ({voxel_volume:g} mm3)")
+        elif voxel_volume <= 2.0:
+            add(10, f"small voxel volume ({voxel_volume:g} mm3)")
+        elif voxel_volume <= 8.0:
+            add(7, f"diagnostic voxel volume ({voxel_volume:g} mm3)")
+        elif voxel_volume <= 20.0:
+            add(4, f"acceptable voxel volume ({voxel_volume:g} mm3)")
+        else:
+            limitations.append(f"large voxel volume ({voxel_volume:g} mm3)")
+    else:
+        limitations.append("voxel volume unavailable")
+
+    if np.isfinite(matrix_rows) and np.isfinite(matrix_cols):
+        min_matrix = min(matrix_rows, matrix_cols)
+        if min_matrix >= 512:
+            add(8, f"large matrix ({format_matrix_size(matrix_rows, matrix_cols)})")
+        elif min_matrix >= 320:
+            add(6, f"large matrix ({format_matrix_size(matrix_rows, matrix_cols)})")
+        elif min_matrix >= 256:
+            add(4, f"standard matrix ({format_matrix_size(matrix_rows, matrix_cols)})")
+        else:
+            limitations.append(f"small matrix ({format_matrix_size(matrix_rows, matrix_cols)})")
+    else:
+        limitations.append("matrix size missing")
+
+    if np.isfinite(slices):
+        if dimensionality == "3D":
+            if slices >= 120:
+                add(10, f"broad 3D coverage ({slices:g} slices)")
+            elif slices >= 64:
+                add(7, f"reasonable 3D coverage ({slices:g} slices)")
+            else:
+                limitations.append(f"limited 3D slice count ({slices:g})")
+        else:
+            if slices >= 24:
+                add(8, f"good 2D coverage ({slices:g} slices)")
+            elif slices >= 16:
+                add(5, f"reasonable 2D coverage ({slices:g} slices)")
+            else:
+                limitations.append(f"limited slice count ({slices:g})")
+    else:
+        limitations.append("number of slices missing")
+
+    if np.isfinite(fov_row) and np.isfinite(fov_col):
+        if 120 <= fov_row <= 320 and 120 <= fov_col <= 320:
+            add(4, f"plausible FOV ({format_pair(fov_row, fov_col, decimals=1)} mm)")
+        else:
+            limitations.append(f"unusual FOV ({format_pair(fov_row, fov_col, decimals=1)} mm)")
+
+    if condition in {"T1", "FLAIR", "MRA"} and dimensionality == "3D":
+        add(5, f"3D {condition} protocol")
+    if condition == "DWI" and np.isfinite(numeric_row_value(row, "diffusion_b_value")):
+        add(4, "diffusion b-value present")
+
+    score = min(round(score, 1), 100.0)
+    return score, "; ".join(reasons), "; ".join(limitations)
+
+
+def quality_level(score: float) -> str:
+    if score >= 85:
+        return "Excellent"
+    if score >= 70:
+        return "High"
+    if score >= 55:
+        return "Usable"
+    return "Review"
+
+
+def add_quality_columns(
+    df: pd.DataFrame,
+    min_score: float = DEFAULT_HIGH_QUALITY_MIN_SCORE,
+) -> pd.DataFrame:
+    out = df.copy()
+    scored = out.apply(score_quality_row, axis=1)
+    out["quality_score"] = [item[0] for item in scored]
+    out["quality_level"] = [quality_level(item[0]) for item in scored]
+    out["quality_reasons"] = [item[1] for item in scored]
+    out["quality_limitations"] = [item[2] for item in scored]
+
+    conditions = (
+        out["image_condition"].map(clean_text)
+        if "image_condition" in out
+        else pd.Series(["Other"] * len(out), index=out.index)
+    )
+    excluded = (
+        out["analysis_excluded"].astype(bool)
+        if "analysis_excluded" in out
+        else pd.Series(False, index=out.index)
+    )
+    out["quality_candidate"] = (
+        ~excluded
+        & pd.to_numeric(out["quality_score"], errors="coerce").ge(min_score)
+        & ~conditions.isin(["Localizer", "Other"])
+    )
+    return out
+
+
+def make_high_quality_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    if "quality_candidate" not in df:
+        df = add_quality_columns(df)
+    candidates = df[df["quality_candidate"]].copy()
+    if candidates.empty:
+        return candidates
+
+    front_columns = [
+        "quality_score",
+        "quality_level",
+        "quality_reasons",
+        "quality_limitations",
+        "image_condition",
+        "dimensionality",
+        "scan_plane",
+        "field_strength_label",
+        "analysis_group",
+        "slice_thickness_mm",
+        "slice_spacing_mm",
+        "slice_gap_mm",
+        "pixel_spacing_mm",
+        "voxel_volume_mm3",
+        "matrix_size",
+        "matrix_source",
+        "number_of_slices",
+        "fov_mm",
+        "repetition_time_ms",
+        "echo_time_ms",
+        "inversion_time_ms",
+        "series_uid",
+    ]
+    ordered_columns = [column for column in front_columns if column in candidates]
+    ordered_columns += [column for column in candidates.columns if column not in ordered_columns]
+    candidates = candidates.sort_values(
+        ["quality_score", "image_condition", "analysis_group"],
+        ascending=[False, True, True],
+    )
+    return candidates[ordered_columns]
+
+
 def make_counts(df: pd.DataFrame) -> pd.DataFrame:
     if "analysis_group" not in df:
         df = add_analysis_filter(df, None)
@@ -2215,10 +2490,12 @@ def make_report(
     counts: pd.DataFrame,
     stats: pd.DataFrame,
     summary: pd.DataFrame,
+    high_quality_candidates: pd.DataFrame,
     figures: list[Path],
     encoding: str,
     max_slice_mm: float | None,
     exclude_slices_le: int | None,
+    high_quality_min_score: float,
 ) -> str:
     detected_rows = [
         {"logical_field": key, "csv_column": value or ""}
@@ -2328,6 +2605,27 @@ def make_report(
         [column for column in summary_display_columns if column in summary]
     ].copy()
 
+    high_quality_display_columns = [
+        "quality_score",
+        "quality_level",
+        "analysis_group",
+        "image_condition",
+        "dimensionality",
+        "scan_plane",
+        "field_strength_label",
+        "slice_thickness_mm",
+        "slice_spacing_mm",
+        "pixel_spacing_mm",
+        "voxel_volume_mm3",
+        "matrix_size",
+        "number_of_slices",
+        "quality_reasons",
+        "quality_limitations",
+    ]
+    high_quality_display = high_quality_candidates[
+        [column for column in high_quality_display_columns if column in high_quality_candidates]
+    ].copy()
+
     figure_lines = "\n".join(
         f"- `{path.relative_to(output_dir)}`" for path in figures
     ) or "- No figures generated."
@@ -2358,6 +2656,10 @@ Rows used for analysis: {len(analysis_df)}
 
 Rows excluded from analysis: {len(excluded_df)}
 
+High-quality candidate rows: {len(high_quality_candidates)}
+
+High-quality score threshold: {high_quality_min_score:g}
+
 Slice exclusion rule: {exclusion_line}
 
 Low slice-count exclusion rule: {slice_count_exclusion_line}
@@ -2369,6 +2671,7 @@ CSV encoding: `{encoding}`
 - `series_with_derived_columns.csv`
 - `included_series_for_analysis.csv`
 - `excluded_series_from_analysis.csv`
+- `high_quality_candidates.csv`
 - `condition_dimension_counts.csv`
 - `summary_by_condition_dimension.csv`
 - `slice_thickness_spacing_counts.csv`
@@ -2402,6 +2705,10 @@ CSV encoding: `{encoding}`
 
 {markdown_table(summary_display, max_rows=40)}
 
+## High-quality candidates
+
+{markdown_table(high_quality_display, max_rows=25)}
+
 ## Key metric summary
 
 {markdown_table(key_stats, max_rows=40)}
@@ -2432,6 +2739,10 @@ CSV encoding: `{encoding}`
   `series_with_derived_columns.csv` for questionable series.
 - Rows with `analysis_excluded=True` are kept in `series_with_derived_columns.csv`
   but are not used for counts, statistics, or figures.
+- `high_quality_candidates.csv` is a tag-based candidate list, not an image-based
+  QC result. The score favors recognized diagnostic series, stronger field
+  strength, finer voxel geometry, small slice gap, sufficient coverage, and
+  plausible FOV/matrix values.
 - Slice thickness vs spacing is shown as split bubble plots. Each point is one
   unique thickness/spacing pair, the label and bubble size show the series count,
   and panels are separated by condition.
@@ -2456,14 +2767,17 @@ def save_outputs(
     encoding: str,
     max_slice_mm: float | None,
     exclude_slices_le: int | None,
+    high_quality_min_score: float,
 ) -> dict[str, Path | list[Path]]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if "analysis_excluded" not in df:
         df = add_analysis_filter(df, max_slice_mm, exclude_slices_le)
+    df = add_quality_columns(df, high_quality_min_score)
 
     analysis_df = df[~df["analysis_excluded"]].copy()
     excluded_df = df[df["analysis_excluded"]].copy()
+    high_quality_candidates = make_high_quality_candidates(analysis_df)
 
     counts = make_counts(analysis_df)
     stats = make_metric_stats(analysis_df)
@@ -2474,6 +2788,7 @@ def save_outputs(
     derived_path = output_dir / "series_with_derived_columns.csv"
     included_path = output_dir / "included_series_for_analysis.csv"
     excluded_path = output_dir / "excluded_series_from_analysis.csv"
+    high_quality_path = output_dir / "high_quality_candidates.csv"
     counts_path = output_dir / "condition_dimension_counts.csv"
     summary_path = output_dir / "summary_by_condition_dimension.csv"
     thickness_spacing_counts_path = output_dir / "slice_thickness_spacing_counts.csv"
@@ -2485,6 +2800,7 @@ def save_outputs(
     write_csv(df, derived_path)
     write_csv(analysis_df, included_path)
     write_csv(excluded_df, excluded_path)
+    write_csv(high_quality_candidates, high_quality_path)
     write_csv(counts, counts_path)
     write_csv(summary, summary_path)
     write_csv(thickness_spacing_counts, thickness_spacing_counts_path)
@@ -2510,10 +2826,12 @@ def save_outputs(
         counts=counts,
         stats=stats,
         summary=summary,
+        high_quality_candidates=high_quality_candidates,
         figures=figures,
         encoding=encoding,
         max_slice_mm=max_slice_mm,
         exclude_slices_le=exclude_slices_le,
+        high_quality_min_score=high_quality_min_score,
     )
     report_path.write_text(report, encoding="utf-8")
 
@@ -2521,6 +2839,7 @@ def save_outputs(
         "derived": derived_path,
         "included": included_path,
         "excluded": excluded_path,
+        "high_quality": high_quality_path,
         "counts": counts_path,
         "summary": summary_path,
         "thickness_spacing_counts": thickness_spacing_counts_path,
@@ -2565,7 +2884,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-other-plots",
         action="store_true",
-        help="Include Other condition in metric boxplots and scatter plots.",
+        help="Include Other condition in metric boxplots and bubble plots.",
     )
     parser.add_argument(
         "--exclude-slice-mm",
@@ -2584,6 +2903,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Exclude rows from counts, statistics, and figures when NumberOfSlices "
             "is less than or equal to this value. Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--high-quality-min-score",
+        type=float,
+        default=DEFAULT_HIGH_QUALITY_MIN_SCORE,
+        help=(
+            "Minimum tag-based quality score for high_quality_candidates.csv. "
+            "Default is 70."
         ),
     )
     parser.add_argument(
@@ -2642,6 +2970,7 @@ def main(argv: list[str] | None = None) -> int:
         encoding=encoding,
         max_slice_mm=args.exclude_slice_mm,
         exclude_slices_le=args.exclude_slices_le,
+        high_quality_min_score=args.high_quality_min_score,
     )
 
     analyzed_count = int((~derived["analysis_excluded"]).sum())
@@ -2652,6 +2981,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Derived CSV: {outputs['derived']}")
     print(f"Summary CSV: {outputs['summary']}")
     print(f"Thickness/spacing counts CSV: {outputs['thickness_spacing_counts']}")
+    print(f"High-quality candidates CSV: {outputs['high_quality']}")
     print(f"Stats CSV: {outputs['stats']}")
     if not args.no_plots:
         print(f"Figures: {len(outputs['figures'])}")
