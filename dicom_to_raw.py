@@ -87,7 +87,8 @@ EXTRA_COLUMNS = ["output_file", "source_folder", "n_slices", "rows", "columns",
                  "pixel_spacing_row_mm", "pixel_spacing_col_mm", "slice_spacing_mm",
                  "image_position_first", "raw_dtype", "y_flipped",
                  "absolute_zyx", "reverse_z", "axis_order",
-                 "split_label", "diffusion_b_value", "volume_in_series"]
+                 "split_label", "diffusion_b_value", "volume_in_series",
+                 "raw_values", "raw_rescale_slope"]
 
 
 def _san(s, default="NA") -> str:
@@ -216,22 +217,53 @@ def slice_position(ds) -> float:
     return float(getattr(ds, "InstanceNumber", 0) or 0)
 
 
-def build_volume(dsets: list):
-    """シリーズの DICOM 群 → スライス順ソート・3Dスタック（格納値のまま）。"""
+def _quantize_real(vol: np.ndarray):
+    """実値(float)ボリュームを 2byte 整数へ。値域に応じ符号と 10のべき乗スケールを決める。
+    戻り値 (stored, dtype, raw_slope)。real = stored × raw_slope。
+    通常データ（int16/uint16範囲）では raw_slope=1（raw=実値そのもの）。"""
+    vmin, vmax = float(np.min(vol)), float(np.max(vol))
+    signed = vmin < -0.5
+    hi = 32000.0 if signed else 60000.0
+    absmax = max(abs(vmin), abs(vmax))
+    gain = 1.0
+    while absmax * gain > hi:           # 桁が大きすぎる時だけ 1/10 ずつ縮小
+        gain /= 10.0
+    raw_slope = 1.0 / gain
+    if signed:
+        stored = np.clip(np.round(vol * gain), -32768, 32767).astype("<i2")
+        dtype = "<i2"
+    else:
+        stored = np.clip(np.round(vol * gain), 0, 65535).astype("<u2")
+        dtype = "<u2"
+    return stored, dtype, raw_slope
+
+
+def build_volume(dsets: list, apply_rescale: bool = True):
+    """シリーズの DICOM 群 → スライス順ソート・3Dスタック。
+    apply_rescale=True: 各スライスに RescaleSlope/Intercept を適用して実値(HU/信号)にし、
+    2byte整数へ量子化（real = 格納値 × raw_slope）。False: DICOM格納値のまま。"""
     dsets = sorted(dsets, key=slice_position)
     rows = int(dsets[0].Rows)
     cols = int(dsets[0].Columns)
     dsets = [d for d in dsets if int(d.Rows) == rows and int(d.Columns) == cols]
-    signed = int(getattr(dsets[0], "PixelRepresentation", 0)) == 1
-    dtype = "<i2" if signed else "<u2"
     planes = []
     for d in dsets:
         try:
-            px = d.pixel_array
+            px = np.asarray(d.pixel_array)
         except Exception:  # noqa: BLE001
             continue
-        planes.append(np.asarray(px))
+        if apply_rescale:
+            sl = float(getattr(d, "RescaleSlope", 1) or 1)
+            ic = float(getattr(d, "RescaleIntercept", 0) or 0)
+            px = px.astype(np.float64) * sl + ic       # 実値（per-slice 係数）
+        planes.append(px)
     vol = np.stack(planes, axis=0)
+    if apply_rescale:
+        vol, dtype, raw_slope = _quantize_real(vol)
+    else:
+        signed = int(getattr(dsets[0], "PixelRepresentation", 0)) == 1
+        dtype = "<i2" if signed else "<u2"
+        raw_slope = 1.0
     # スライス間隔(mm): 位置の中央差 → 無ければ SpacingBetweenSlices/厚
     pos = np.array([slice_position(d) for d in dsets], float)
     if len(pos) > 1:
@@ -257,7 +289,7 @@ def build_volume(dsets: list):
             "axis_dirs": np.array([n, col_dir, row_dir]),   # axis0(slice),1(row),2(col)
             "axis_sp": np.array([dz, ps[0], ps[1]]),        # 同順の間隔[mm]
         }
-    return vol, dsets, dtype, dz, geom
+    return vol, dsets, dtype, dz, geom, raw_slope
 
 
 # LPS 絶対座標の正方向: x=L=[1,0,0], y=P=[0,1,0], z=S=[0,0,1]
@@ -332,19 +364,24 @@ def csv_row(ds, out_file, src, vol, sx, sy, sz, dtype, info: dict) -> dict:
         "split_label": info.get("split_label", ""),
         "diffusion_b_value": info.get("diffusion_b_value", ""),
         "volume_in_series": info.get("volume_in_series", ""),
+        "raw_values": info.get("raw_values", ""),
+        "raw_rescale_slope": info.get("raw_rescale_slope", ""),
     })
     return row
 
 
 def _emit_volume(dsets, leaf, root, flip_y, absolute_zyx, reverse_z,
-                 stem_extra, out_root, used, records):
+                 stem_extra, out_root, used, records, apply_rescale=True):
     """1 サブグループ（=1ボリューム）を向き補正して .raw/.hdr 出力＋CSV行を作る。"""
-    vol, sorted_ds, dtype, dz, geom = build_volume(dsets)
+    vol, sorted_ds, dtype, dz, geom, raw_slope = build_volume(dsets, apply_rescale)
     tmpl = sorted_ds[0]
     ps = [float(x) for x in getattr(tmpl, "PixelSpacing", [1.0, 1.0])]
     sx, sy, sz = ps[1], ps[0], dz                  # 列(x), 行(y), スライス(z) 間隔
     info = {"y_flipped": False, "absolute_zyx": False, "reverse_z": reverse_z,
-            "axis_order": "slice,row,col(取得順)", **stem_extra.get("info", {})}
+            "axis_order": "slice,row,col(取得順)",
+            "raw_rescale_slope": f"{raw_slope:g}",
+            "raw_values": "rescaled(real)" if apply_rescale else "stored(as-is)",
+            **stem_extra.get("info", {})}
 
     if absolute_zyx:
         if geom is None:
@@ -374,7 +411,7 @@ def _emit_volume(dsets, leaf, root, flip_y, absolute_zyx, reverse_z,
 
 
 def process(root: str, out_root: str, flip_y: bool, absolute_zyx: bool = False,
-            reverse_z: bool = False, split_specs=None) -> None:
+            reverse_z: bool = False, split_specs=None, apply_rescale: bool = True) -> None:
     os.makedirs(out_root, exist_ok=True)
     split_specs = DEFAULT_SPLIT_TAGS if split_specs is None else split_specs
     leaves = find_leaf_dirs(root)
@@ -409,7 +446,7 @@ def process(root: str, out_root: str, flip_y: bool, absolute_zyx: bool = False,
                 }}
                 try:
                     _emit_volume(sub, leaf, root, flip_y, absolute_zyx, reverse_z,
-                                 extra, out_root, used, records)
+                                 extra, out_root, used, records, apply_rescale)
                 except Exception as e:  # noqa: BLE001
                     print(f"[skip] {leaf} ({uid[:12]}…){suffix}: {e}")
 
@@ -446,6 +483,9 @@ def main() -> None:
                          "b値/拡散方向/エコー/時相 に追加される。例 EchoTime,0019,100c")
     ap.add_argument("--no-split", action="store_true",
                     help="シリーズ内のサブグループ分割をしない（1シリーズ=1ボリューム）")
+    ap.add_argument("--no-rescale", action="store_true",
+                    help="RescaleSlope/Intercept を適用せず DICOM 格納値のまま出力"
+                         "（既定は適用して実値=HU/信号で出力）")
     args = ap.parse_args()
 
     split_specs = [] if args.no_split else list(DEFAULT_SPLIT_TAGS)
@@ -465,7 +505,7 @@ def main() -> None:
 
     process(args.input, args.out_root, flip_y=not args.no_flip_y,
             absolute_zyx=args.absolute_zyx, reverse_z=args.reverse_z,
-            split_specs=split_specs)
+            split_specs=split_specs, apply_rescale=not args.no_rescale)
 
 
 if __name__ == "__main__":
