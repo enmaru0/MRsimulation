@@ -89,6 +89,11 @@ DWI 等は確実に分離される。
 
 ### summary_dicom_tag.csv の主な列
 
+**1画像（=1 raw）につき 1 行**。DWI 等でシリーズが分割された場合は**各ボリュームが別行**になる。
+
+- 先頭列 **`stem`** = 保存した `.raw`/`.hdr` の名称（拡張子なし）。行とファイルが 1:1 で対応。
+- 2列目 **`body_part`** = `BodyPartExamined`。
+
 患者/検査（`PatientID`, `PatientName`, `StudyDate`, `StudyTime`, `StudyInstanceUID`,
 `AccessionNumber`）、シリーズ（`SeriesNumber`, `SeriesDescription`, `SeriesInstanceUID`,
 `Modality`, `BodyPartExamined`）、装置（`Manufacturer`, `ManufacturerModelName`,

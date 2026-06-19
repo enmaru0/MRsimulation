@@ -82,7 +82,9 @@ TAG_COLUMNS = [
     ("WindowWidth", "WindowWidth"),
 ]
 
-# 出力で算出して付け足す列（DICOMタグ以外の派生情報）
+# 出力で算出して付け足す列（DICOMタグ以外の派生情報）。
+# 先頭列 stem は保存した .raw/.hdr の名称（拡張子なし）と一致。
+LEAD_COLUMNS = ["stem", "body_part"]
 EXTRA_COLUMNS = ["output_file", "source_folder", "n_slices", "rows", "columns",
                  "pixel_spacing_row_mm", "pixel_spacing_col_mm", "slice_spacing_mm",
                  "image_position_first", "raw_dtype", "y_flipped",
@@ -413,7 +415,7 @@ def write_raw(vol: np.ndarray, dtype: str, out_base: str,
         f.write(f"{nx} {ny} {nz} 2 {sx:g} {sy:g} {sz:g}")
 
 
-def csv_row(ds, out_file, src, vol, sx, sy, sz, dtype, info: dict) -> dict:
+def csv_row(ds, stem, out_file, src, vol, sx, sy, sz, dtype, info: dict) -> dict:
     nz, ny, nx = vol.shape
     row = {}
     for col, attr in TAG_COLUMNS:
@@ -423,6 +425,8 @@ def csv_row(ds, out_file, src, vol, sx, sy, sz, dtype, info: dict) -> dict:
         row[col] = "" if v is None else str(v)
     ipp = getattr(ds, "ImagePositionPatient", "")
     row.update({
+        "stem": stem,                              # 保存した .raw/.hdr の名称（拡張子なし）
+        "body_part": str(getattr(ds, "BodyPartExamined", "") or ""),
         "output_file": out_file,
         "source_folder": src,
         "n_slices": nz, "rows": ny, "columns": nx,
@@ -476,7 +480,7 @@ def _emit_volume(dsets, leaf, root, flip_y, absolute_zyx, reverse_z,
         stem = f"{stem}_{n+1}"
     out_base = os.path.join(out_root, stem)
     write_raw(vol, dtype, out_base, sx, sy, sz)
-    records.append(csv_row(tmpl, stem + ".raw", leaf, vol, sx, sy, sz, dtype, info))
+    records.append(csv_row(tmpl, stem, stem + ".raw", leaf, vol, sx, sy, sz, dtype, info))
     print(f"[ok] {os.path.relpath(leaf, root)}  -> {stem}.raw  "
           f"({vol.shape[0]}x{vol.shape[1]}x{vol.shape[2]}, {dtype})"
           f"{'  ' + info['split_label'] if info.get('split_label') else ''}"
@@ -536,7 +540,7 @@ def process(root: str, out_root: str, flip_y: bool, absolute_zyx: bool = False,
     n_vol = len(records)
 
     if records:
-        cols = [c for c, _ in TAG_COLUMNS] + EXTRA_COLUMNS
+        cols = LEAD_COLUMNS + [c for c, _ in TAG_COLUMNS] + EXTRA_COLUMNS
         csv_path = os.path.join(out_root, "summary_dicom_tag.csv")
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols)
