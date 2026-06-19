@@ -134,17 +134,62 @@ def read_dicoms(folder: str):
 
 # 同一シリーズ内で別ボリュームに分けるタグ（keyword と ファイル名ラベル）。
 # これらは「1ボリューム内では一定・ボリューム間で変わる」量。--split-tags で追加可。
+# "@bvalue" は複数ベンダーの b 値タグを横断検出する仮想スペック。
 DEFAULT_SPLIT_TAGS = [
-    ("DiffusionBValue", "b"),                  # (0018,9087) 拡散 b 値
+    ("@bvalue", "b"),                          # 拡散 b 値（標準/シーケンス/私的タグ横断）
     ("DiffusionGradientOrientation", "dir"),   # (0018,9089) 拡散傾斜方向（ベクトル）
     ("EchoNumbers", "e"),                      # (0018,0086) エコー番号（マルチエコー）
     ("TemporalPositionIdentifier", "t"),       # (0020,0100) 時相（ダイナミック）
 ]
 
 
+def _num(v):
+    """数値化（'\\'区切りの先頭値にも対応）。失敗時 None。"""
+    try:
+        return round(float(v), 4)
+    except Exception:  # noqa: BLE001
+        try:
+            return round(float(str(v).split("\\")[0]), 4)
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def diffusion_bvalue(ds):
+    """複数ベンダーの b 値タグを横断して b 値を取得する。無ければ None。
+    標準(0018,9087) → MRDiffusionSequence(0018,9117) → Siemens(0019,100C)
+    → Philips(2001,1003) → GE(0043,1039) の順。"""
+    v = getattr(ds, "DiffusionBValue", None)
+    n = _num(v) if v not in (None, "") else None
+    if n is not None:
+        return n
+    seq = getattr(ds, "MRDiffusionSequence", None)
+    if seq:
+        for it in seq:
+            v = getattr(it, "DiffusionBValue", None)
+            n = _num(v) if v not in (None, "") else None
+            if n is not None:
+                return n
+    for tag in [(0x0019, 0x100C), (0x2001, 0x1003)]:   # Siemens, Philips
+        if tag in ds:
+            n = _num(ds[tag].value)
+            if n is not None:
+                return n
+    if (0x0043, 0x1039) in ds:                          # GE: 先頭値、+1e9オフセット除去
+        val = ds[0x0043, 0x1039].value
+        first = val[0] if isinstance(val, (list, pydicom.multival.MultiValue)) else val
+        n = _num(first)
+        if n is not None:
+            if n >= 1e9:
+                n -= 1e9
+            return round(n, 4) if n >= 0 else None
+    return None
+
+
 def _resolve_tag(ds, spec):
-    """spec（DICOMキーワード or 'gggg,eeee' 16進）の値を取り出す。無ければ None。
+    """spec（DICOMキーワード / 'gggg,eeee' / '@bvalue'）の値を取り出す。無ければ None。
     ベクトルは丸めた tuple、数値は丸めた float、その他は文字列で返す。"""
+    if spec == "@bvalue":
+        return diffusion_bvalue(ds)
     v = None
     if "," in spec:                            # 'gggg,eeee' 形式（私的タグ等）
         try:
@@ -185,6 +230,34 @@ def split_by_frame(dsets, split_specs):
     for d in dsets:
         subs.setdefault(frame_key(d, split_specs), []).append(d)
     return subs
+
+
+def split_by_position_repeat(dsets):
+    """同一スライス位置が N 回現れる＝N ボリューム、として分割（タグで分けきれない時の安全網）。
+    各位置のフレームを b値→エコー→時相→取得番号→Instance番号 で並べ、i 番目を vol i に割当てる。
+    戻り値: ボリュームごとの DICOM リスト。分割不要なら 1 要素。"""
+    bypos: dict = {}
+    for d in dsets:
+        bypos.setdefault(round(slice_position(d), 3), []).append(d)
+    if not bypos:
+        return [list(dsets)]
+    v = max(len(x) for x in bypos.values())
+    if v <= 1:
+        return [list(dsets)]
+
+    def okey(d):
+        b = diffusion_bvalue(d)
+        return (b if b is not None else 0.0,
+                _num(getattr(d, "EchoNumbers", 0)) or 0,
+                _num(getattr(d, "TemporalPositionIdentifier", 0)) or 0,
+                _num(getattr(d, "AcquisitionNumber", 0)) or 0,
+                _num(getattr(d, "InstanceNumber", 0)) or 0)
+
+    vols = [[] for _ in range(v)]
+    for frames in bypos.values():
+        for i, fr in enumerate(sorted(frames, key=okey)):
+            vols[min(i, v - 1)].append(fr)
+    return [x for x in vols if x]
 
 
 def frame_suffix(fkey, split_specs, dir_index) -> str:
@@ -425,23 +498,33 @@ def process(root: str, out_root: str, flip_y: bool, absolute_zyx: bool = False,
             continue
         for uid, dsets in groups.items():
             subs = split_by_frame(dsets, split_specs) if split_specs else {(): dsets}
-            multi = len(subs) > 1
+            # frame_key で分けた各群を、さらに「位置リピート」で分割（安全網）。
+            volumes = []                           # (fkey, dsets, posrep_idx, posrep_count)
+            for fkey, sub in sorted(subs.items(), key=lambda kv: str(kv[0])):
+                parts = split_by_position_repeat(sub) if split_specs else [sub]
+                for pi, part in enumerate(parts):
+                    volumes.append((fkey, part, pi, len(parts)))
+            multi = len(volumes) > 1
             if multi:
+                tag_v = len({fk for fk, _, _, _ in volumes})
+                pos_v = any(pc > 1 for _, _, _, pc in volumes)
                 print(f"[split] {os.path.relpath(leaf, root)} ({uid[:12]}…): "
-                      f"1シリーズ → {len(subs)} ボリューム")
-            # 方向ベクトル（tuple値）→ファイル名用の通し番号
+                      f"1シリーズ → {len(volumes)} ボリューム"
+                      f"{'（位置リピートで分割。タグ未検出のためラベルは v番号）' if pos_v and tag_v <= 1 else ''}")
             dir_index = {}
             if multi:
-                dirvals = sorted({(s, v) for fk in subs for (s, v) in fk
+                dirvals = sorted({(s, v) for fk, _, _, _ in volumes for (s, v) in fk
                                   if isinstance(v, tuple)}, key=lambda x: str(x))
                 dir_index = {sv: i for i, sv in enumerate(dirvals)}
-            for vi, (fkey, sub) in enumerate(sorted(subs.items(), key=lambda kv: str(kv[0]))):
+            for vi, (fkey, sub, pi, pc) in enumerate(volumes):
                 suffix = frame_suffix(fkey, split_specs, dir_index) if multi else ""
-                bval = next((v for (s, v) in fkey if s == "DiffusionBValue"), "")
+                if pc > 1:                         # 位置リピート分割分の通し番号
+                    suffix += f"_v{pi}"
+                bval = diffusion_bvalue(sub[0])    # 複数ベンダー横断で b 値取得
                 extra = {"suffix": suffix, "info": {
                     "split_label": suffix.lstrip("_"),
-                    "diffusion_b_value": "" if bval == "" else
-                    (int(bval) if isinstance(bval, float) and bval == int(bval) else bval),
+                    "diffusion_b_value": "" if bval is None else
+                    (int(bval) if bval == int(bval) else bval),
                     "volume_in_series": vi if multi else "",
                 }}
                 try:
