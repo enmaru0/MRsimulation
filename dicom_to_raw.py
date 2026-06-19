@@ -85,7 +85,8 @@ TAG_COLUMNS = [
 # 出力で算出して付け足す列（DICOMタグ以外の派生情報）
 EXTRA_COLUMNS = ["output_file", "source_folder", "n_slices", "rows", "columns",
                  "pixel_spacing_row_mm", "pixel_spacing_col_mm", "slice_spacing_mm",
-                 "image_position_first", "raw_dtype", "y_flipped"]
+                 "image_position_first", "raw_dtype", "y_flipped",
+                 "absolute_zyx", "reverse_z", "axis_order"]
 
 
 def _san(s, default="NA") -> str:
@@ -169,7 +170,51 @@ def build_volume(dsets: list):
     if dz <= 0:
         dz = float(getattr(dsets[0], "SpacingBetweenSlices", 0) or
                    getattr(dsets[0], "SliceThickness", 0) or 1.0)
-    return vol, dsets, dtype, dz
+
+    # 患者座標(LPS)での各配列軸の方向ベクトル（絶対ZYX再配置用）。
+    iop = getattr(dsets[0], "ImageOrientationPatient", None)
+    geom = None
+    if iop is not None and len(iop) == 6:
+        row_dir = np.array(iop[0:3], float)    # 列index増加方向（=axis2/x）
+        col_dir = np.array(iop[3:6], float)    # 行index増加方向（=axis1/y）
+        n = np.cross(row_dir, col_dir)
+        nn = np.linalg.norm(n)
+        n = n / nn if nn > 0 else n
+        # スライス昇順ソート済み → slice index 増加方向は +n
+        ps = [float(x) for x in getattr(dsets[0], "PixelSpacing", [1.0, 1.0])]
+        geom = {
+            "axis_dirs": np.array([n, col_dir, row_dir]),   # axis0(slice),1(row),2(col)
+            "axis_sp": np.array([dz, ps[0], ps[1]]),        # 同順の間隔[mm]
+        }
+    return vol, dsets, dtype, dz, geom
+
+
+# LPS 絶対座標の正方向: x=L=[1,0,0], y=P=[0,1,0], z=S=[0,0,1]
+# 出力軸順 (axis0=Z=S, axis1=Y=P, axis2=X=L)
+_LPS_TARGETS = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], float)
+
+
+def reorient_absolute_zyx(vol: np.ndarray, geom: dict):
+    """配列を患者絶対座標 LPS の ZYX 順（軸0=S-I, 軸1=A-P, 軸2=L-R, index増=+S/+P/+L）へ
+    並べ替え（permute）＋反転（flip）する。リサンプルはしない（最近接軸へスナップ）。
+    戻り値: (vol2, (sx, sy, sz))  ※sx=axis2間隔, sy=axis1, sz=axis0。"""
+    dirs = geom["axis_dirs"]            # (3,3) 各入力軸の LPS 方向
+    sps = geom["axis_sp"]
+    perm, flips, used = [], [], set()
+    for t in _LPS_TARGETS:             # 出力 axis0->S, axis1->P, axis2->L
+        scores = [abs(float(np.dot(dirs[i], t))) if i not in used else -1.0
+                  for i in range(3)]
+        i = int(np.argmax(scores))
+        used.add(i)
+        perm.append(i)
+        flips.append(float(np.dot(dirs[i], t)) < 0)
+    vol2 = np.transpose(vol, perm)
+    out_sp = sps[perm]
+    for ax, fl in enumerate(flips):
+        if fl:
+            vol2 = np.flip(vol2, axis=ax)
+    sz, sy, sx = float(out_sp[0]), float(out_sp[1]), float(out_sp[2])
+    return np.ascontiguousarray(vol2), (sx, sy, sz)
 
 
 def output_name(ds) -> str:
@@ -182,18 +227,17 @@ def output_name(ds) -> str:
 
 
 def write_raw(vol: np.ndarray, dtype: str, out_base: str,
-              dx: float, dy: float, dz: float, flip_y: bool):
+              sx: float, sy: float, sz: float):
+    """向き補正済みボリュームを書き出す。sx=axis2(列), sy=axis1(行), sz=axis0(スライス)間隔[mm]。"""
     nz, ny, nx = vol.shape
-    arr = vol.astype(dtype)
-    if flip_y:
-        arr = arr[:, ::-1, :]
+    arr = np.ascontiguousarray(vol.astype(dtype))
     with open(out_base + ".raw", "wb") as f:
-        f.write(np.ascontiguousarray(arr).tobytes())
+        f.write(arr.tobytes())
     with open(out_base + ".hdr", "w") as f:
-        f.write(f"{nx} {ny} {nz} 2 {dx:g} {dy:g} {dz:g}")
+        f.write(f"{nx} {ny} {nz} 2 {sx:g} {sy:g} {sz:g}")
 
 
-def csv_row(ds, out_file, src, vol, dx, dy, dz, dtype, flip_y) -> dict:
+def csv_row(ds, out_file, src, vol, sx, sy, sz, dtype, info: dict) -> dict:
     nz, ny, nx = vol.shape
     row = {}
     for col, attr in TAG_COLUMNS:
@@ -206,19 +250,24 @@ def csv_row(ds, out_file, src, vol, dx, dy, dz, dtype, flip_y) -> dict:
         "output_file": out_file,
         "source_folder": src,
         "n_slices": nz, "rows": ny, "columns": nx,
-        "pixel_spacing_row_mm": f"{dy:g}", "pixel_spacing_col_mm": f"{dx:g}",
-        "slice_spacing_mm": f"{dz:g}",
+        "pixel_spacing_row_mm": f"{sy:g}", "pixel_spacing_col_mm": f"{sx:g}",
+        "slice_spacing_mm": f"{sz:g}",
         "image_position_first": "\\".join(str(x) for x in ipp) if ipp != "" else "",
         "raw_dtype": "int16" if dtype == "<i2" else "uint16",
-        "y_flipped": flip_y,
+        "y_flipped": info.get("y_flipped", False),
+        "absolute_zyx": info.get("absolute_zyx", False),
+        "reverse_z": info.get("reverse_z", False),
+        "axis_order": info.get("axis_order", ""),
     })
     return row
 
 
-def process(root: str, out_root: str, flip_y: bool) -> None:
+def process(root: str, out_root: str, flip_y: bool,
+            absolute_zyx: bool = False, reverse_z: bool = False) -> None:
     os.makedirs(out_root, exist_ok=True)
     leaves = find_leaf_dirs(root)
-    print(f"[start] {len(leaves)} 最下層フォルダ -> {out_root}")
+    print(f"[start] {len(leaves)} 最下層フォルダ -> {out_root}"
+          f"{'  [absolute ZYX]' if absolute_zyx else ''}{'  [reverse-z]' if reverse_z else ''}")
     records, used = [], {}
     n_vol = 0
     for leaf in leaves:
@@ -227,24 +276,44 @@ def process(root: str, out_root: str, flip_y: bool) -> None:
             continue
         for uid, dsets in groups.items():
             try:
-                vol, sorted_ds, dtype, dz = build_volume(dsets)
+                vol, sorted_ds, dtype, dz, geom = build_volume(dsets)
             except Exception as e:  # noqa: BLE001
                 print(f"[skip] {leaf} ({uid[:12]}…): {e}")
                 continue
             tmpl = sorted_ds[0]
             ps = [float(x) for x in getattr(tmpl, "PixelSpacing", [1.0, 1.0])]
-            dy, dx = ps[0], ps[1]                 # [row, col]
+            sx, sy, sz = ps[1], ps[0], dz          # 列(x), 行(y), スライス(z) 間隔
+            info = {"y_flipped": False, "absolute_zyx": False,
+                    "reverse_z": reverse_z, "axis_order": "slice,row,col(取得順)"}
+
+            if absolute_zyx:
+                if geom is None:
+                    print(f"[warn] {leaf}: IOP/IPP無し → 絶対ZYX再配置できず取得順で出力")
+                else:
+                    vol, (sx, sy, sz) = reorient_absolute_zyx(vol, geom)
+                    info.update(absolute_zyx=True, axis_order="Z(S-I),Y(A-P),X(L-R) LPS+")
+            else:
+                # 従来の raw ビューア向け y(行)反転（既定ON）
+                if flip_y:
+                    vol = vol[:, ::-1, :]
+                    info["y_flipped"] = True
+
+            if reverse_z:                          # スライス(z)方向を反転
+                vol = vol[::-1, :, :]
+
+            vol = np.ascontiguousarray(vol)
             stem = output_name(tmpl)
             n = used.get(stem, 0)
             used[stem] = n + 1
             if n:                                  # 同名衝突は連番付与
                 stem = f"{stem}_{n+1}"
             out_base = os.path.join(out_root, stem)
-            write_raw(vol, dtype, out_base, dx, dy, dz, flip_y)
-            records.append(csv_row(tmpl, stem + ".raw", leaf, vol, dx, dy, dz, dtype, flip_y))
+            write_raw(vol, dtype, out_base, sx, sy, sz)
+            records.append(csv_row(tmpl, stem + ".raw", leaf, vol, sx, sy, sz, dtype, info))
             n_vol += 1
             print(f"[ok] {os.path.relpath(leaf, root)}  -> {stem}.raw  "
-                  f"({vol.shape[0]}x{vol.shape[1]}x{vol.shape[2]}, {dtype})")
+                  f"({vol.shape[0]}x{vol.shape[1]}x{vol.shape[2]}, {dtype})"
+                  f"{'  ' + info['axis_order'] if absolute_zyx else ''}")
 
     if records:
         cols = [c for c, _ in TAG_COLUMNS] + EXTRA_COLUMNS
@@ -263,9 +332,17 @@ def main() -> None:
     ap.add_argument("input", help="DICOM を含むルートフォルダ（再帰探索）")
     ap.add_argument("--out-root", default="raw_out", help="出力先（既定 raw_out）")
     ap.add_argument("--no-flip-y", action="store_true",
-                    help="raw の行(y)反転をしない（既定は反転）")
+                    help="raw の行(y)反転をしない（既定は反転。--absolute-zyx 時は無効）")
+    ap.add_argument("--reverse-z", action="store_true",
+                    help="出力スライス(z)方向を反転する")
+    ap.add_argument("--absolute-zyx", action="store_true",
+                    help="患者絶対座標 LPS の ZYX 順（軸0=S-I, 軸1=A-P, 軸2=L-R）へ"
+                         "並べ替え＋反転（permute/flipのみ、リサンプル無し）。"
+                         "撮像面(AX/COR/SAG)に依らず一定の向きで出力。"
+                         "この時 y反転は適用しない（向きは座標で確定）")
     args = ap.parse_args()
-    process(args.input, args.out_root, flip_y=not args.no_flip_y)
+    process(args.input, args.out_root, flip_y=not args.no_flip_y,
+            absolute_zyx=args.absolute_zyx, reverse_z=args.reverse_z)
 
 
 if __name__ == "__main__":
