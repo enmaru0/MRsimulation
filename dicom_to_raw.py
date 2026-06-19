@@ -86,7 +86,8 @@ TAG_COLUMNS = [
 EXTRA_COLUMNS = ["output_file", "source_folder", "n_slices", "rows", "columns",
                  "pixel_spacing_row_mm", "pixel_spacing_col_mm", "slice_spacing_mm",
                  "image_position_first", "raw_dtype", "y_flipped",
-                 "absolute_zyx", "reverse_z", "axis_order"]
+                 "absolute_zyx", "reverse_z", "axis_order",
+                 "split_label", "diffusion_b_value", "volume_in_series"]
 
 
 def _san(s, default="NA") -> str:
@@ -128,6 +129,76 @@ def read_dicoms(folder: str):
         uid = str(getattr(ds, "SeriesInstanceUID", "noseries"))
         groups.setdefault(uid, []).append(ds)
     return groups
+
+
+# 同一シリーズ内で別ボリュームに分けるタグ（keyword と ファイル名ラベル）。
+# これらは「1ボリューム内では一定・ボリューム間で変わる」量。--split-tags で追加可。
+DEFAULT_SPLIT_TAGS = [
+    ("DiffusionBValue", "b"),                  # (0018,9087) 拡散 b 値
+    ("DiffusionGradientOrientation", "dir"),   # (0018,9089) 拡散傾斜方向（ベクトル）
+    ("EchoNumbers", "e"),                      # (0018,0086) エコー番号（マルチエコー）
+    ("TemporalPositionIdentifier", "t"),       # (0020,0100) 時相（ダイナミック）
+]
+
+
+def _resolve_tag(ds, spec):
+    """spec（DICOMキーワード or 'gggg,eeee' 16進）の値を取り出す。無ければ None。
+    ベクトルは丸めた tuple、数値は丸めた float、その他は文字列で返す。"""
+    v = None
+    if "," in spec:                            # 'gggg,eeee' 形式（私的タグ等）
+        try:
+            g, e = spec.split(",")
+            tag = (int(g, 16), int(e, 16))
+            if tag in ds:
+                v = ds[tag].value
+        except Exception:  # noqa: BLE001
+            v = None
+    else:
+        v = getattr(ds, spec, None)
+    if v is None or v == "":
+        return None
+    if isinstance(v, (list, pydicom.multival.MultiValue)):
+        try:
+            return tuple(round(float(x), 4) for x in v)
+        except Exception:  # noqa: BLE001
+            return tuple(str(x) for x in v)
+    try:
+        return round(float(v), 4)
+    except Exception:  # noqa: BLE001
+        return str(v)
+
+
+def frame_key(ds, split_specs):
+    """ボリュームを区別するキー（存在する split タグの (spec, value) タプル）。"""
+    key = []
+    for spec, _label in split_specs:
+        val = _resolve_tag(ds, spec)
+        if val is not None:
+            key.append((spec, val))
+    return tuple(key)
+
+
+def split_by_frame(dsets, split_specs):
+    """シリーズの DICOM 群を frame_key（b値/方向/エコー/時相）でサブグループ化。"""
+    subs: dict = {}
+    for d in dsets:
+        subs.setdefault(frame_key(d, split_specs), []).append(d)
+    return subs
+
+
+def frame_suffix(fkey, split_specs, dir_index) -> str:
+    """frame_key からファイル名サフィックス（例 _b1000, _e2, _t3, _dir5）を作る。"""
+    label = {spec: lab for spec, lab in split_specs}
+    parts = []
+    for spec, val in fkey:
+        lab = label.get(spec, spec.replace(",", ""))
+        if isinstance(val, tuple):                 # 方向ベクトル等 → 通し番号
+            parts.append(f"{lab}{dir_index.get((spec, val), 0)}")
+        elif isinstance(val, float) and val == int(val):
+            parts.append(f"{lab}{int(val)}")
+        else:
+            parts.append(f"{lab}{str(val).replace('.', 'p')}")
+    return "_" + "_".join(parts) if parts else ""
 
 
 def slice_position(ds) -> float:
@@ -258,62 +329,91 @@ def csv_row(ds, out_file, src, vol, sx, sy, sz, dtype, info: dict) -> dict:
         "absolute_zyx": info.get("absolute_zyx", False),
         "reverse_z": info.get("reverse_z", False),
         "axis_order": info.get("axis_order", ""),
+        "split_label": info.get("split_label", ""),
+        "diffusion_b_value": info.get("diffusion_b_value", ""),
+        "volume_in_series": info.get("volume_in_series", ""),
     })
     return row
 
 
-def process(root: str, out_root: str, flip_y: bool,
-            absolute_zyx: bool = False, reverse_z: bool = False) -> None:
+def _emit_volume(dsets, leaf, root, flip_y, absolute_zyx, reverse_z,
+                 stem_extra, out_root, used, records):
+    """1 サブグループ（=1ボリューム）を向き補正して .raw/.hdr 出力＋CSV行を作る。"""
+    vol, sorted_ds, dtype, dz, geom = build_volume(dsets)
+    tmpl = sorted_ds[0]
+    ps = [float(x) for x in getattr(tmpl, "PixelSpacing", [1.0, 1.0])]
+    sx, sy, sz = ps[1], ps[0], dz                  # 列(x), 行(y), スライス(z) 間隔
+    info = {"y_flipped": False, "absolute_zyx": False, "reverse_z": reverse_z,
+            "axis_order": "slice,row,col(取得順)", **stem_extra.get("info", {})}
+
+    if absolute_zyx:
+        if geom is None:
+            print(f"[warn] {leaf}: IOP/IPP無し → 絶対ZYX再配置できず取得順で出力")
+        else:
+            vol, (sx, sy, sz) = reorient_absolute_zyx(vol, geom)
+            info.update(absolute_zyx=True, axis_order="Z(S-I),Y(A-P),X(L-R) LPS+")
+    elif flip_y:
+        vol = vol[:, ::-1, :]
+        info["y_flipped"] = True
+    if reverse_z:
+        vol = vol[::-1, :, :]
+
+    vol = np.ascontiguousarray(vol)
+    stem = output_name(tmpl) + stem_extra.get("suffix", "")
+    n = used.get(stem, 0)
+    used[stem] = n + 1
+    if n:
+        stem = f"{stem}_{n+1}"
+    out_base = os.path.join(out_root, stem)
+    write_raw(vol, dtype, out_base, sx, sy, sz)
+    records.append(csv_row(tmpl, stem + ".raw", leaf, vol, sx, sy, sz, dtype, info))
+    print(f"[ok] {os.path.relpath(leaf, root)}  -> {stem}.raw  "
+          f"({vol.shape[0]}x{vol.shape[1]}x{vol.shape[2]}, {dtype})"
+          f"{'  ' + info['split_label'] if info.get('split_label') else ''}"
+          f"{'  ' + info['axis_order'] if absolute_zyx else ''}")
+
+
+def process(root: str, out_root: str, flip_y: bool, absolute_zyx: bool = False,
+            reverse_z: bool = False, split_specs=None) -> None:
     os.makedirs(out_root, exist_ok=True)
+    split_specs = DEFAULT_SPLIT_TAGS if split_specs is None else split_specs
     leaves = find_leaf_dirs(root)
     print(f"[start] {len(leaves)} 最下層フォルダ -> {out_root}"
-          f"{'  [absolute ZYX]' if absolute_zyx else ''}{'  [reverse-z]' if reverse_z else ''}")
+          f"{'  [absolute ZYX]' if absolute_zyx else ''}{'  [reverse-z]' if reverse_z else ''}"
+          f"{'  [split-by:' + ','.join(s for s, _ in split_specs) + ']' if split_specs else '  [no-split]'}")
     records, used = [], {}
-    n_vol = 0
     for leaf in leaves:
         groups = read_dicoms(leaf)
         if not groups:
             continue
         for uid, dsets in groups.items():
-            try:
-                vol, sorted_ds, dtype, dz, geom = build_volume(dsets)
-            except Exception as e:  # noqa: BLE001
-                print(f"[skip] {leaf} ({uid[:12]}…): {e}")
-                continue
-            tmpl = sorted_ds[0]
-            ps = [float(x) for x in getattr(tmpl, "PixelSpacing", [1.0, 1.0])]
-            sx, sy, sz = ps[1], ps[0], dz          # 列(x), 行(y), スライス(z) 間隔
-            info = {"y_flipped": False, "absolute_zyx": False,
-                    "reverse_z": reverse_z, "axis_order": "slice,row,col(取得順)"}
+            subs = split_by_frame(dsets, split_specs) if split_specs else {(): dsets}
+            multi = len(subs) > 1
+            if multi:
+                print(f"[split] {os.path.relpath(leaf, root)} ({uid[:12]}…): "
+                      f"1シリーズ → {len(subs)} ボリューム")
+            # 方向ベクトル（tuple値）→ファイル名用の通し番号
+            dir_index = {}
+            if multi:
+                dirvals = sorted({(s, v) for fk in subs for (s, v) in fk
+                                  if isinstance(v, tuple)}, key=lambda x: str(x))
+                dir_index = {sv: i for i, sv in enumerate(dirvals)}
+            for vi, (fkey, sub) in enumerate(sorted(subs.items(), key=lambda kv: str(kv[0]))):
+                suffix = frame_suffix(fkey, split_specs, dir_index) if multi else ""
+                bval = next((v for (s, v) in fkey if s == "DiffusionBValue"), "")
+                extra = {"suffix": suffix, "info": {
+                    "split_label": suffix.lstrip("_"),
+                    "diffusion_b_value": "" if bval == "" else
+                    (int(bval) if isinstance(bval, float) and bval == int(bval) else bval),
+                    "volume_in_series": vi if multi else "",
+                }}
+                try:
+                    _emit_volume(sub, leaf, root, flip_y, absolute_zyx, reverse_z,
+                                 extra, out_root, used, records)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[skip] {leaf} ({uid[:12]}…){suffix}: {e}")
 
-            if absolute_zyx:
-                if geom is None:
-                    print(f"[warn] {leaf}: IOP/IPP無し → 絶対ZYX再配置できず取得順で出力")
-                else:
-                    vol, (sx, sy, sz) = reorient_absolute_zyx(vol, geom)
-                    info.update(absolute_zyx=True, axis_order="Z(S-I),Y(A-P),X(L-R) LPS+")
-            else:
-                # 従来の raw ビューア向け y(行)反転（既定ON）
-                if flip_y:
-                    vol = vol[:, ::-1, :]
-                    info["y_flipped"] = True
-
-            if reverse_z:                          # スライス(z)方向を反転
-                vol = vol[::-1, :, :]
-
-            vol = np.ascontiguousarray(vol)
-            stem = output_name(tmpl)
-            n = used.get(stem, 0)
-            used[stem] = n + 1
-            if n:                                  # 同名衝突は連番付与
-                stem = f"{stem}_{n+1}"
-            out_base = os.path.join(out_root, stem)
-            write_raw(vol, dtype, out_base, sx, sy, sz)
-            records.append(csv_row(tmpl, stem + ".raw", leaf, vol, sx, sy, sz, dtype, info))
-            n_vol += 1
-            print(f"[ok] {os.path.relpath(leaf, root)}  -> {stem}.raw  "
-                  f"({vol.shape[0]}x{vol.shape[1]}x{vol.shape[2]}, {dtype})"
-                  f"{'  ' + info['axis_order'] if absolute_zyx else ''}")
+    n_vol = len(records)
 
     if records:
         cols = [c for c, _ in TAG_COLUMNS] + EXTRA_COLUMNS
@@ -340,9 +440,32 @@ def main() -> None:
                          "並べ替え＋反転（permute/flipのみ、リサンプル無し）。"
                          "撮像面(AX/COR/SAG)に依らず一定の向きで出力。"
                          "この時 y反転は適用しない（向きは座標で確定）")
+    ap.add_argument("--split-tags", default=None,
+                    help="同一シリーズ内を別ボリュームに分けるタグを追加（カンマ区切り）。"
+                         "DICOMキーワード or 'gggg,eeee' 16進。既定の "
+                         "b値/拡散方向/エコー/時相 に追加される。例 EchoTime,0019,100c")
+    ap.add_argument("--no-split", action="store_true",
+                    help="シリーズ内のサブグループ分割をしない（1シリーズ=1ボリューム）")
     args = ap.parse_args()
+
+    split_specs = [] if args.no_split else list(DEFAULT_SPLIT_TAGS)
+    if args.split_tags and not args.no_split:
+        toks = [t.strip() for t in args.split_tags.split(",") if t.strip()]
+        i = 0
+        while i < len(toks):
+            # 'gggg,eeee' は2トークンに割れるので再結合
+            if re.fullmatch(r"[0-9A-Fa-fx]{4}", toks[i]) and i + 1 < len(toks) \
+                    and re.fullmatch(r"[0-9A-Fa-fx]{4}", toks[i + 1]):
+                spec = f"{toks[i]},{toks[i+1]}"
+                i += 2
+            else:
+                spec = toks[i]
+                i += 1
+            split_specs.append((spec, _san(spec.replace(",", ""))[:6] or "v"))
+
     process(args.input, args.out_root, flip_y=not args.no_flip_y,
-            absolute_zyx=args.absolute_zyx, reverse_z=args.reverse_z)
+            absolute_zyx=args.absolute_zyx, reverse_z=args.reverse_z,
+            split_specs=split_specs)
 
 
 if __name__ == "__main__":
